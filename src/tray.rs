@@ -1,3 +1,4 @@
+use crate::i18n;
 use crate::utils::to_wide;
 use std::sync::Mutex;
 use windows::Win32::Foundation::*;
@@ -18,7 +19,7 @@ const IDM_SETTINGS: usize = 3001;
 const IDM_EXIT: usize = 3002;
 
 /// Posted to the main thread when the user clicks the tray icon
-/// or chooses "Настройки" from the context menu.
+/// or chooses "Settings" from the context menu.
 pub const WM_TRAY_OPEN_SETTINGS: u32 = WM_APP + 1;
 
 // ============================================================
@@ -115,8 +116,8 @@ unsafe fn show_context_menu(hwnd: HWND) {
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
 
-        let text_settings = to_wide("Настройки");
-        let text_exit = to_wide("Выход");
+        let text_settings = to_wide(i18n::t("tray.menu.settings"));
+        let text_exit = to_wide(i18n::t("tray.menu.exit"));
 
         let _ = AppendMenuW(menu, MF_STRING, IDM_SETTINGS, PCWSTR(text_settings.as_ptr()));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());

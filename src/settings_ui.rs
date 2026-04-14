@@ -1,4 +1,5 @@
 use crate::autostart;
+use crate::i18n::{self, Language};
 use crate::settings::{self, HotkeyConfig, Settings};
 use crate::theme;
 use crate::utils::to_wide;
@@ -25,8 +26,10 @@ const IDC_BTN_CANCEL: i32 = 109;
 const IDC_CHK_PUNTO: i32 = 110;
 const IDC_CHK_TASKBAR: i32 = 111;
 const IDC_CHK_AUTOSTART: i32 = 112;
+const IDC_COMBO_LANG: i32 = 114;
 
 // Section header IDs (for accent coloring in WM_CTLCOLORSTATIC)
+const IDC_SEC_GENERAL: i32 = 200;
 const IDC_SEC_HOTKEYS: i32 = 201;
 const IDC_SEC_FOLDER: i32 = 202;
 const IDC_SEC_FUNC: i32 = 203;
@@ -34,13 +37,16 @@ const IDC_SEC_FUNC: i32 = 203;
 const HKM_SETHOTKEY: u32 = 0x0401;
 const HKM_GETHOTKEY: u32 = 0x0402;
 const EM_SETMARGINS: u32 = 0x00D3;
+const CB_ADDSTRING: u32 = 0x0143;
+const CB_SETCURSEL: u32 = 0x014E;
+const CB_GETCURSEL: u32 = 0x0147;
 
 // ============================================================
 // Layout
 // ============================================================
 
 const WIN_W: i32 = 460;
-const WIN_H: i32 = 520;
+const WIN_H: i32 = 600;
 
 const MARGIN: i32 = 24;
 const LABEL_W: i32 = 186;
@@ -51,21 +57,25 @@ const INPUT_H: i32 = 26;
 const Y_TITLE: i32 = 14;
 const Y_ACCENT: i32 = 40;
 
-const Y_SEC_HK: i32 = 52;
-const Y_HK_START: i32 = 76;
+// General (language picker)
+const Y_SEC_GEN: i32 = 52;
+const Y_LANG: i32 = 76;
+
+const Y_SEC_HK: i32 = 130;
+const Y_HK_START: i32 = 154;
 const HK_STEP: i32 = 32;
 
-const Y_SEP1: i32 = 204;
-const Y_SEC_FOLDER: i32 = 214;
-const Y_FOLDER: i32 = 238;
+const Y_SEP1: i32 = 282;
+const Y_SEC_FOLDER: i32 = 292;
+const Y_FOLDER: i32 = 316;
 const FOLDER_W: i32 = 330;
 
-const Y_SEP2: i32 = 276;
-const Y_SEC_FUNC: i32 = 286;
-const Y_CHK_START: i32 = 310;
+const Y_SEP2: i32 = 354;
+const Y_SEC_FUNC: i32 = 364;
+const Y_CHK_START: i32 = 388;
 const CHK_STEP: i32 = 28;
 
-const Y_BUTTONS: i32 = 420;
+const Y_BUTTONS: i32 = 496;
 const BTN_W: i32 = 140;
 const BTN_H: i32 = 38;
 const BTN_GAP: i32 = 16;
@@ -141,7 +151,7 @@ pub fn open(current: &Settings) {
         let sw = GetSystemMetrics(SM_CXSCREEN);
         let sh = GetSystemMetrics(SM_CYSCREEN);
 
-        let title = to_wide("Настройки");
+        let title = to_wide(i18n::t("settings.title"));
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
             class, PCWSTR(title.as_ptr()),
@@ -176,16 +186,23 @@ unsafe fn create_controls(parent: HWND, hinst: HINSTANCE, s: &Settings) {
         // Title
         create_label(parent, hinst, font_title, MARGIN, Y_TITLE, 300, 24, "Screen Translator", 0);
 
-        // ── ГОРЯЧИЕ КЛАВИШИ ──
+        // ── GENERAL / Language ──
+        create_label(parent, hinst, font_section, MARGIN, Y_SEC_GEN, 200, 16,
+            i18n::t("settings.section.general"), IDC_SEC_GENERAL);
+        create_label(parent, hinst, font, MARGIN, Y_LANG + 3, LABEL_W, 20,
+            i18n::t("settings.label.language"), 0);
+        create_lang_combo(parent, hinst, font, INPUT_X, Y_LANG, INPUT_W, &s.language);
+
+        // ── HOTKEYS ──
         create_label(parent, hinst, font_section, MARGIN, Y_SEC_HK, 200, 16,
-            "ГОРЯЧИЕ КЛАВИШИ", IDC_SEC_HOTKEYS);
+            i18n::t("settings.section.hotkeys"), IDC_SEC_HOTKEYS);
 
         let hk_class = to_wide("msctls_hotkey32");
         let hotkeys: &[(&str, i32, &HotkeyConfig)] = &[
-            ("Перевод текста:", IDC_HK_TRANSLATE, &s.hk_translate),
-            ("OCR + перевод:",  IDC_HK_OCR,       &s.hk_ocr),
-            ("Скриншот:",       IDC_HK_SCREENSHOT, &s.hk_screenshot),
-            ("Смена раскладки:", IDC_HK_LAYOUT,    &s.hk_layout),
+            (i18n::t("settings.hotkey.translate"),  IDC_HK_TRANSLATE,  &s.hk_translate),
+            (i18n::t("settings.hotkey.ocr"),        IDC_HK_OCR,        &s.hk_ocr),
+            (i18n::t("settings.hotkey.screenshot"), IDC_HK_SCREENSHOT, &s.hk_screenshot),
+            (i18n::t("settings.hotkey.layout"),     IDC_HK_LAYOUT,     &s.hk_layout),
         ];
 
         for (i, &(label, id, hk)) in hotkeys.iter().enumerate() {
@@ -204,9 +221,9 @@ unsafe fn create_controls(parent: HWND, hinst: HINSTANCE, s: &Settings) {
             let _ = SendMessageW(ctrl, HKM_SETHOTKEY, WPARAM(hk.to_hotkey_ctrl_param()), LPARAM(0));
         }
 
-        // ── ПАПКА СКРИНШОТОВ ──
+        // ── SCREENSHOT FOLDER ──
         create_label(parent, hinst, font_section, MARGIN, Y_SEC_FOLDER, 200, 16,
-            "ПАПКА СКРИНШОТОВ", IDC_SEC_FOLDER);
+            i18n::t("settings.section.folder"), IDC_SEC_FOLDER);
 
         let edit_class = to_wide("EDIT");
         let folder_wide = to_wide(&s.screenshot_folder);
@@ -222,21 +239,55 @@ unsafe fn create_controls(parent: HWND, hinst: HINSTANCE, s: &Settings) {
 
         create_od_button(parent, hinst, MARGIN + FOLDER_W + 10, Y_FOLDER, 60, INPUT_H, "...", IDC_BTN_BROWSE);
 
-        // ── ФУНКЦИИ ──
+        // ── FEATURES ──
         create_label(parent, hinst, font_section, MARGIN, Y_SEC_FUNC, 200, 16,
-            "ФУНКЦИИ", IDC_SEC_FUNC);
+            i18n::t("settings.section.functions"), IDC_SEC_FUNC);
 
         create_checkbox(parent, hinst, font, MARGIN, Y_CHK_START, 400, 22,
-            "Авто-смена раскладки (Punto Switcher)", IDC_CHK_PUNTO, s.punto_enabled);
+            i18n::t("settings.checkbox.punto"), IDC_CHK_PUNTO, s.punto_enabled);
         create_checkbox(parent, hinst, font, MARGIN, Y_CHK_START + CHK_STEP, 400, 22,
-            "Центрирование иконок панели задач", IDC_CHK_TASKBAR, s.taskbar_center_enabled);
+            i18n::t("settings.checkbox.taskbar"), IDC_CHK_TASKBAR, s.taskbar_center_enabled);
         create_checkbox(parent, hinst, font, MARGIN, Y_CHK_START + CHK_STEP * 2, 400, 22,
-            "Запускать при старте Windows", IDC_CHK_AUTOSTART, autostart::is_enabled());
+            i18n::t("settings.checkbox.autostart"), IDC_CHK_AUTOSTART, autostart::is_enabled());
 
-        // ── Кнопки ──
+        // ── Buttons ──
         let bx = (WIN_W - BTN_W * 2 - BTN_GAP) / 2;
-        create_od_button(parent, hinst, bx, Y_BUTTONS, BTN_W, BTN_H, "Сохранить", IDC_BTN_SAVE);
-        create_od_button(parent, hinst, bx + BTN_W + BTN_GAP, Y_BUTTONS, BTN_W, BTN_H, "Отмена", IDC_BTN_CANCEL);
+        create_od_button(parent, hinst, bx, Y_BUTTONS, BTN_W, BTN_H,
+            i18n::t("settings.btn.save"), IDC_BTN_SAVE);
+        create_od_button(parent, hinst, bx + BTN_W + BTN_GAP, Y_BUTTONS, BTN_W, BTN_H,
+            i18n::t("settings.btn.cancel"), IDC_BTN_CANCEL);
+    }
+}
+
+unsafe fn create_lang_combo(
+    parent: HWND, hinst: HINSTANCE, font: HFONT,
+    x: i32, y: i32, w: i32, current_code: &str,
+) {
+    unsafe {
+        let class = to_wide("COMBOBOX");
+        // CBS_DROPDOWNLIST = 0x0003, WS_VSCROLL = 0x00200000
+        let style = WS_CHILD | WS_VISIBLE | WS_TABSTOP
+            | WINDOW_STYLE(0x0003) | WINDOW_STYLE(0x00200000);
+        // Height parameter includes the dropdown; give it 260 for ~10 items.
+        let ctrl = CreateWindowExW(
+            WINDOW_EX_STYLE(0), PCWSTR(class.as_ptr()), PCWSTR(std::ptr::null()),
+            style, x, y, w, 260,
+            parent, HMENU(IDC_COMBO_LANG as *mut _), hinst, None,
+        ).unwrap_or_default();
+
+        let _ = SendMessageW(ctrl, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+
+        let current = Language::from_code(current_code);
+        let mut selected_index: usize = 0;
+        for (i, lang) in Language::all().iter().enumerate() {
+            let name = to_wide(lang.native_name());
+            let _ = SendMessageW(ctrl, CB_ADDSTRING, WPARAM(0),
+                LPARAM(name.as_ptr() as isize));
+            if *lang == current {
+                selected_index = i;
+            }
+        }
+        let _ = SendMessageW(ctrl, CB_SETCURSEL, WPARAM(selected_index), LPARAM(0));
     }
 }
 
@@ -325,6 +376,18 @@ unsafe fn read_checkbox(parent: HWND, id: i32) -> bool {
     unsafe {
         let ctrl = GetDlgItem(parent, id).unwrap_or_default();
         SendMessageW(ctrl, BM_GETCHECK, WPARAM(0), LPARAM(0)).0 != 0
+    }
+}
+
+unsafe fn read_selected_language(parent: HWND) -> String {
+    unsafe {
+        let ctrl = GetDlgItem(parent, IDC_COMBO_LANG).unwrap_or_default();
+        let idx = SendMessageW(ctrl, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
+        if idx < 0 { return "en".to_string(); }
+        Language::all()
+            .get(idx as usize)
+            .map(|l| l.code().to_string())
+            .unwrap_or_else(|| "en".to_string())
     }
 }
 
@@ -494,7 +557,7 @@ unsafe extern "system" fn settings_proc(
                 // Section headers get accent color
                 let ctrl = HWND(lp.0 as *mut _);
                 let ctrl_id = GetDlgCtrlID(ctrl);
-                let text_clr = if ctrl_id >= 201 && ctrl_id <= 203 {
+                let text_clr = if ctrl_id >= 200 && ctrl_id <= 203 {
                     theme::CLR_ACCENT
                 } else {
                     theme::CLR_TEXT
@@ -523,6 +586,7 @@ unsafe extern "system" fn settings_proc(
                             screenshot_folder: read_folder(hwnd),
                             punto_enabled: read_checkbox(hwnd, IDC_CHK_PUNTO),
                             taskbar_center_enabled: read_checkbox(hwnd, IDC_CHK_TASKBAR),
+                            language: read_selected_language(hwnd),
                         };
 
                         // Autostart → registry

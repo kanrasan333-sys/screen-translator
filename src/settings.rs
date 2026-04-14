@@ -18,9 +18,13 @@ pub struct Settings {
     pub punto_enabled: bool,
     #[serde(default = "yes")]
     pub taskbar_center_enabled: bool,
+    /// ISO 639-1 language code for the UI ("en", "ru", "es", ...).
+    #[serde(default = "default_lang")]
+    pub language: String,
 }
 
 fn yes() -> bool { true }
+fn default_lang() -> String { "en".to_string() }
 
 impl Settings {
     /// Compile-time default for `static Mutex<Settings>` initialisation.
@@ -32,11 +36,16 @@ impl Settings {
         screenshot_folder: String::new(),
         punto_enabled: true,
         taskbar_center_enabled: true,
+        language: String::new(), // filled with "en" on load if missing
     };
 }
 
 impl Default for Settings {
-    fn default() -> Self { Self::DEFAULT }
+    fn default() -> Self {
+        let mut s = Self::DEFAULT;
+        s.language = default_lang();
+        s
+    }
 }
 
 impl HotkeyConfig {

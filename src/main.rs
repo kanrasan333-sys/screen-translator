@@ -3,6 +3,7 @@
 mod autostart;
 mod autotype;
 mod capture;
+mod i18n;
 mod layout;
 mod ocr;
 mod popup;
@@ -93,6 +94,7 @@ fn main() {
     }
 
     let s = settings::load();
+    i18n::set_from_code(&s.language);
     *CURRENT_SETTINGS.lock().unwrap() = s.clone();
 
     popup::init();
@@ -139,7 +141,8 @@ fn run_main_loop() {
 
             // Apply settings changes from the settings window.
             if let Some(new) = settings_ui::take_updated_settings() {
-                println!("[*] Настройки обновлены");
+                println!("[*] Settings updated");
+                i18n::set_from_code(&new.language);
                 unregister_hotkeys();
                 register_hotkeys(&new);
 
@@ -211,7 +214,7 @@ fn unregister_hotkeys() {
 // ============================================================
 
 fn handle_text_translate() {
-    println!("[*] Копирование выделенного текста...");
+    println!("[*] Copying selected text...");
     simulate_copy();
     thread::sleep(Duration::from_millis(250));
 
@@ -220,21 +223,21 @@ fn handle_text_translate() {
         None => return,
     };
 
-    println!("[*] Текст: {}...", utils::truncate(&text, 80));
-    popup::show_loading("Переводим...");
+    println!("[*] Text: {}...", utils::truncate(&text, 80));
+    popup::show_loading(i18n::t("popup.translating"));
 
     thread::spawn(move || {
         init_com_in_thread();
         let result = match translate::translate(&text) {
             Ok((translated, direction)) => {
-                println!("[+] Перевод ({}): {}...", direction, utils::truncate(&translated, 80));
+                println!("[+] Translated ({}): {}...", direction, utils::truncate(&translated, 80));
                 TranslationResult { original: text, translated, direction, is_error: false }
             }
             Err(e) => {
-                println!("[!] Ошибка перевода: {e}");
+                println!("[!] Translation error: {e}");
                 TranslationResult {
                     original: text,
-                    translated: format!("Ошибка: {e}"),
+                    translated: format!("{}{e}", i18n::t("popup.error_prefix")),
                     direction: String::new(),
                     is_error: true,
                 }
@@ -246,12 +249,12 @@ fn handle_text_translate() {
 }
 
 fn handle_screenshot_translate() {
-    println!("[*] Выберите область экрана...");
+    println!("[*] Select a screen area...");
     dispatch_capture_result(capture::select_and_capture());
 }
 
 fn handle_screenshot_save() {
-    println!("[*] Выберите область для скриншота...");
+    println!("[*] Select a screen area for screenshot...");
     dispatch_capture_result(capture::select_and_capture());
 }
 
@@ -260,13 +263,13 @@ fn dispatch_capture_result(result: Option<capture::CaptureAction>) {
         Some(capture::CaptureAction::Translate(p, w, h)) => do_ocr_and_translate(&p, w, h),
         Some(capture::CaptureAction::Save(p, w, h)) => save_captured(&p, w, h),
         Some(capture::CaptureAction::Clipboard(p, w, h)) => copy_to_clipboard(&p, w, h),
-        None => println!("[*] Отменено"),
+        None => println!("[*] Cancelled"),
     }
 }
 
 fn do_ocr_and_translate(pixels: &[u8], width: u32, height: u32) {
-    println!("[*] Захвачена область {width}x{height}, распознавание...");
-    popup::show_loading("Распознаём текст...");
+    println!("[*] Captured {width}x{height}, running OCR...");
+    popup::show_loading(i18n::t("popup.recognizing"));
 
     let pixels = pixels.to_vec();
     let screenshot_folder = get_settings().screenshot_folder.clone();
@@ -277,20 +280,20 @@ fn do_ocr_and_translate(pixels: &[u8], width: u32, height: u32) {
         let text = match ocr::recognize(&pixels, width, height) {
             Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
             Ok(_) => {
-                println!("[!] Текст не распознан");
+                println!("[!] No text recognized");
                 deliver_result(TranslationResult {
                     original: String::new(),
-                    translated: "Текст не распознан в выбранной области".into(),
+                    translated: i18n::t("popup.no_text").to_string(),
                     direction: "info".into(),
                     is_error: false,
                 });
                 return;
             }
             Err(e) => {
-                println!("[!] Ошибка OCR: {e}");
+                println!("[!] OCR error: {e}");
                 deliver_result(TranslationResult {
                     original: String::new(),
-                    translated: format!("Ошибка OCR: {e}"),
+                    translated: format!("{}{e}", i18n::t("popup.ocr_error_prefix")),
                     direction: String::new(),
                     is_error: true,
                 });
@@ -298,26 +301,26 @@ fn do_ocr_and_translate(pixels: &[u8], width: u32, height: u32) {
             }
         };
 
-        println!("[*] Распознано: {}...", utils::truncate(&text, 80));
+        println!("[*] Recognized: {}...", utils::truncate(&text, 80));
 
         // Auto-save screenshot if folder is configured.
         if !screenshot_folder.is_empty() {
             match screenshot::save_png(&pixels, width, height, &screenshot_folder) {
-                Ok(_) => println!("[+] Скрин автосохранён в {screenshot_folder}"),
-                Err(e) => println!("[!] Автосохранение скрина: {e}"),
+                Ok(_) => println!("[+] Auto-saved screenshot to {screenshot_folder}"),
+                Err(e) => println!("[!] Auto-save error: {e}"),
             }
         }
 
         let result = match translate::translate(&text) {
             Ok((translated, direction)) => {
-                println!("[+] Перевод: {}...", utils::truncate(&translated, 80));
+                println!("[+] Translated: {}...", utils::truncate(&translated, 80));
                 TranslationResult { original: text, translated, direction, is_error: false }
             }
             Err(e) => {
-                println!("[!] Ошибка перевода: {e}");
+                println!("[!] Translation error: {e}");
                 TranslationResult {
                     original: text,
-                    translated: format!("Ошибка: {e}"),
+                    translated: format!("{}{e}", i18n::t("popup.error_prefix")),
                     direction: String::new(),
                     is_error: true,
                 }
@@ -335,13 +338,13 @@ fn deliver_result(r: TranslationResult) {
 fn save_captured(pixels: &[u8], width: u32, height: u32) {
     match save_with_dialog(pixels, width, height) {
         Ok(Some(path)) => {
-            println!("[+] Скриншот сохранён: {path}");
-            popup::show("", &format!("Скриншот сохранён:\n{path}"), "info");
+            println!("[+] Screenshot saved: {path}");
+            popup::show("", &format!("{}:\n{}", i18n::t("popup.screenshot_saved"), path), "info");
         }
-        Ok(None) => println!("[*] Сохранение отменено"),
+        Ok(None) => println!("[*] Save cancelled"),
         Err(e) => {
-            println!("[!] Ошибка сохранения: {e}");
-            popup::show("", &format!("Ошибка: {e}"), "error");
+            println!("[!] Save error: {e}");
+            popup::show("", &format!("{}{e}", i18n::t("popup.error_prefix")), "error");
         }
     }
 }
@@ -400,7 +403,7 @@ fn save_with_dialog(pixels: &[u8], width: u32, height: u32) -> anyhow::Result<Op
 }
 
 fn handle_layout_switch() {
-    println!("[*] Смена раскладки выделенного текста...");
+    println!("[*] Switching layout of selected text...");
     simulate_copy();
     thread::sleep(Duration::from_millis(250));
 
@@ -410,7 +413,7 @@ fn handle_layout_switch() {
     };
 
     let converted = layout::convert(&text);
-    println!("[+] {} → {}", utils::truncate(&text, 40), utils::truncate(&converted, 40));
+    println!("[+] {} -> {}", utils::truncate(&text, 40), utils::truncate(&converted, 40));
 
     if let Ok(mut cb) = arboard::Clipboard::new() {
         let _ = cb.set_text(&converted);
@@ -425,22 +428,14 @@ fn handle_settings() {
 
 fn handle_autotype_toggle() {
     let enabled = autotype::toggle();
-    let msg = if enabled {
-        "Авто-смена раскладки включена"
-    } else {
-        "Авто-смена раскладки выключена"
-    };
+    let msg = i18n::t(if enabled { "popup.autotype_on" } else { "popup.autotype_off" });
     println!("[*] {msg}");
     popup::show("", msg, "info");
 }
 
 fn handle_taskbar_center_toggle() {
     let enabled = taskbar_center::toggle();
-    let msg = if enabled {
-        "Центрирование иконок таскбара ВКЛ"
-    } else {
-        "Центрирование иконок таскбара ВЫКЛ"
-    };
+    let msg = i18n::t(if enabled { "popup.taskbar_on" } else { "popup.taskbar_off" });
     println!("[*] {msg}");
     popup::show("", msg, "info");
 }
@@ -453,7 +448,7 @@ fn copy_to_clipboard(pixels: &[u8], width: u32, height: u32) {
     }
 
     let Ok(mut cb) = arboard::Clipboard::new() else {
-        println!("[!] Буфер обмена недоступен");
+        println!("[!] Clipboard unavailable");
         return;
     };
 
@@ -464,12 +459,12 @@ fn copy_to_clipboard(pixels: &[u8], width: u32, height: u32) {
     };
     match cb.set_image(img) {
         Ok(()) => {
-            println!("[+] Скриншот скопирован в буфер обмена ({width}x{height})");
-            popup::show("", &format!("Скриншот скопирован ({width}x{height})"), "info");
+            println!("[+] Screenshot copied to clipboard ({width}x{height})");
+            popup::show("", &format!("{} ({width}x{height})", i18n::t("popup.screenshot_copied")), "info");
         }
         Err(e) => {
-            println!("[!] Ошибка копирования: {e}");
-            popup::show("", &format!("Ошибка: {e}"), "error");
+            println!("[!] Copy error: {e}");
+            popup::show("", &format!("{}{e}", i18n::t("popup.error_prefix")), "error");
         }
     }
 }
@@ -504,7 +499,7 @@ fn clipboard_text() -> Option<String> {
     match arboard::Clipboard::new().and_then(|mut cb| cb.get_text()) {
         Ok(t) if !t.trim().is_empty() => Some(t.trim().to_string()),
         _ => {
-            println!("[!] Буфер обмена пуст");
+            println!("[!] Clipboard is empty");
             None
         }
     }

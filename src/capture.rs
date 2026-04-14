@@ -1,3 +1,4 @@
+use crate::i18n;
 use crate::theme;
 use crate::utils::{lparam_to_point, to_wide};
 use std::sync::Mutex;
@@ -477,8 +478,8 @@ unsafe fn paint_overlay(hdc: HDC) {
 
             if phase == Phase::Toolbar {
                 let (btn_tr, btn_save) = toolbar_buttons(rx, ry, rw, rh, sh);
-                draw_button(hdc, &btn_tr, "\u{041F}\u{0435}\u{0440}\u{0435}\u{0432}\u{043E}\u{0434}", true);
-                draw_button(hdc, &btn_save, "\u{0421}\u{043E}\u{0445}\u{0440}\u{0430}\u{043D}\u{0438}\u{0442}\u{044C}", false);
+                draw_button(hdc, &btn_tr, i18n::t("capture.btn.translate"), true);
+                draw_button(hdc, &btn_save, i18n::t("capture.btn.save"), false);
                 draw_hint(hdc, rx, ry, rw, rh, sh);
             }
         } else {
@@ -563,7 +564,7 @@ unsafe fn draw_button(hdc: HDC, btn: &BtnRect, text: &str, primary: bool) {
 unsafe fn draw_hint(hdc: HDC, rx: i32, ry: i32, rw: i32, rh: i32, sh: i32) {
     unsafe {
         let (btn_tr, _) = toolbar_buttons(rx, ry, rw, rh, sh);
-        let hint = "Ctrl+C \u{2014} \u{043A}\u{043E}\u{043F}\u{0438}\u{0440}\u{043E}\u{0432}\u{0430}\u{0442}\u{044C}";
+        let hint = i18n::t("capture.hint.copy");
         let f = font(|f| f.hint);
         let old_font = SelectObject(hdc, f);
         SetBkMode(hdc, TRANSPARENT);
@@ -581,7 +582,7 @@ unsafe fn draw_hint(hdc: HDC, rx: i32, ry: i32, rw: i32, rh: i32, sh: i32) {
 
 unsafe fn draw_initial_hint(hdc: HDC, sw: i32, sh: i32) {
     unsafe {
-        let hint = "\u{0412}\u{044B}\u{0434}\u{0435}\u{043B}\u{0438}\u{0442}\u{0435} \u{043E}\u{0431}\u{043B}\u{0430}\u{0441}\u{0442}\u{044C} \u{044D}\u{043A}\u{0440}\u{0430}\u{043D}\u{0430}";
+        let hint = i18n::t("capture.hint.initial");
         let f = font(|f| f.initial);
         let old_font = SelectObject(hdc, f);
         SetBkMode(hdc, TRANSPARENT);

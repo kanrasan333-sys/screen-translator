@@ -1,64 +1,78 @@
 # Screen Translator
 
-Легковесная утилита для Windows: перевод выделенного текста и распознавание
-текста с экрана (OCR) по горячим клавишам. Работает в фоне из системного
-трея, без открытых окон.
+**A 4-in-1 Windows background utility that replaces Lightshot, Punto Switcher,
+TaskbarX, and QTranslate — in a single 3 MB executable with no installer,
+no ads, and no bundled telemetry.**
 
-A lightweight Windows background utility for translating selected text and
-running OCR on screen regions via global hotkeys. Lives in the system tray.
+Lives in the system tray and exposes everything through global hotkeys.
 
 ---
 
-## Возможности / Features
+## What it replaces
 
-- **Перевод выделенного текста** — копирует выделение в буфер обмена,
-  переводит через [MyMemory](https://mymemory.translated.net/) и показывает
-  всплывающее окно рядом с курсором. Направление RU ↔ EN определяется
-  автоматически.
-- **OCR области экрана** — рисуете прямоугольник мышью, содержимое
-  распознаётся через [OCR.space](https://ocr.space/) (основной движок) с
-  откатом на Windows WinRT OCR, затем переводится.
-- **Скриншот области** — захват выделенной области прямо в буфер обмена.
-- **Смена раскладки (Punto)** — вручную переписывает последнее введённое
-  слово из ошибочной раскладки в правильную (`привет` ⇄ `ghbdtn`).
-  Автоматический режим отслеживает ввод в реальном времени.
-- **Центрирование иконок панели задач** — динамически держит иконки
-  по центру таскбара, освобождая место у края экрана.
-- **Системный трей** — окно настроек открывается кликом по иконке,
-  правый клик даёт меню «Настройки / Выход».
-- **Автозагрузка Windows** — опционально добавляет приложение в
+| Replaces | With this feature |
+| --- | --- |
+| **Lightshot** | Region screenshot to clipboard (`Ctrl+Alt+D`) |
+| **QTranslate** / Google Translate popup | Clipboard translation with popup (`Ctrl+Alt+T`) and region OCR + translation (`Ctrl+Alt+S`) |
+| **Punto Switcher** | Manual and automatic keyboard-layout correction for the last typed word (`привет` ⇄ `ghbdtn`) |
+| **TaskbarX** / TaskbarCenter | Dynamically keeps taskbar icons centered |
+
+Everything is configurable through a single settings window and runs from the
+system tray with a ~20 MB memory footprint.
+
+---
+
+## Features
+
+- **Clipboard translation** — copies the current selection, translates it
+  via [MyMemory](https://mymemory.translated.net/) (no API key required),
+  and shows a popup next to the cursor. RU ↔ EN direction is auto-detected.
+- **Region OCR + translation** — draw a rectangle with the mouse, the
+  captured pixels are recognized via [OCR.space](https://ocr.space/) (primary
+  engine) with a fallback to the built-in Windows WinRT OCR, then translated.
+- **Region screenshot** — capture a screen area directly to the clipboard
+  (Lightshot-style), optionally also saved to a folder of your choice.
+- **Punto-style layout correction** — manually rewrite the last typed word
+  from the wrong keyboard layout into the right one, or let the automatic
+  mode detect and fix gibberish in real time as you type.
+- **Taskbar icon centering** — dynamically repositions icons to the middle
+  of the taskbar and keeps them centered as icons come and go.
+- **System tray** — left-click opens settings, right-click shows a
+  "Settings / Exit" menu. The console window is hidden.
+- **Windows autostart** — optional one-click toggle that writes to
   `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
 
 ---
 
-## Горячие клавиши по умолчанию / Default hotkeys
+## Default hotkeys
 
-| Клавиша / Hotkey | Действие / Action |
+| Hotkey | Action |
 | --- | --- |
-| `Ctrl+Alt+T` | Перевести выделенный текст |
-| `Ctrl+Alt+S` | Выделить область → OCR → перевод |
-| `Ctrl+Alt+D` | Скриншот области в буфер |
-| `Ctrl+Alt+L` | Смена раскладки последнего слова |
+| `Ctrl+Alt+T` | Translate the currently selected text |
+| `Ctrl+Alt+S` | Select a region → OCR → translate |
+| `Ctrl+Alt+D` | Screenshot a region to the clipboard |
+| `Ctrl+Alt+L` | Fix the keyboard layout of the last typed word |
 
-Все хоткеи меняются через окно настроек (клик по иконке в трее).
+All hotkeys are remappable from the settings window (click the tray icon).
 
 ---
 
-## Сборка / Build
+## Build
 
-Требуется Rust **edition 2024** (stable 1.85+) и Windows 10/11.
+Requires Rust **edition 2024** (stable 1.85+) and Windows 10 / 11.
 
 ```sh
 cargo build --release
 ```
 
-Бинарник появится в `target/release/screen-translator.exe`.
+The binary is produced at `target/release/screen-translator.exe` and is
+fully self-contained — just copy it anywhere and run.
 
 ### OCR.space API key
 
-По умолчанию используется публичный демо-ключ `helloworld` с очень низкими
-лимитами. Получите бесплатный ключ на <https://ocr.space/ocrapi> и
-подставьте его при сборке:
+The default build uses the public demo key `helloworld`, which has very
+low rate limits. Get a free personal key at <https://ocr.space/ocrapi>
+and bake it in at build time:
 
 ```sh
 # PowerShell
@@ -71,25 +85,29 @@ set OCR_SPACE_API_KEY=your_key_here && cargo build --release
 OCR_SPACE_API_KEY=your_key_here cargo build --release
 ```
 
-Если ключ не задан и демо-квота исчерпана — автоматически используется
-встроенный Windows OCR (требует установленных языковых пакетов).
+If no key is set and the demo quota is exhausted, OCR automatically falls
+back to the built-in Windows engine (requires the corresponding language
+packs to be installed in Windows).
 
 ---
 
-## Использование / Usage
+## Usage
 
-1. Запустите `screen-translator.exe` — иконка появится в системном трее
-   (возле часов, может быть спрятана под стрелкой «показать скрытые значки»).
-2. Выделите текст в любом приложении и нажмите `Ctrl+Alt+T` — перевод
-   покажется во всплывающем окне.
-3. Для OCR нажмите `Ctrl+Alt+S`, выделите область экрана мышью —
-   распознанный и переведённый текст появится во всплывающем окне.
-4. Кликните иконку в трее для настроек: хоткеи, папка скриншотов,
-   включение Punto / центрирования таскбара / автозагрузки.
+1. Run `screen-translator.exe`. A tray icon appears next to the clock
+   (possibly hidden under the "show hidden icons" arrow — drag it out to
+   pin it).
+2. Select any text in any application and press `Ctrl+Alt+T`. The
+   translation pops up next to the cursor.
+3. Press `Ctrl+Alt+S`, draw a rectangle on screen with the mouse —
+   the recognized and translated text appears in the popup.
+4. Press `Ctrl+Alt+D` to capture a region straight into the clipboard,
+   ready to paste into any chat or document.
+5. Click the tray icon to open settings: remap hotkeys, pick a screenshot
+   folder, toggle Punto / taskbar centering / autostart.
 
 ---
 
-## Зависимости / Dependencies
+## Dependencies
 
 - [`windows`](https://crates.io/crates/windows) — Win32 API bindings
 - [`arboard`](https://crates.io/crates/arboard) — clipboard access
@@ -99,43 +117,43 @@ OCR_SPACE_API_KEY=your_key_here cargo build --release
 - [`chrono`](https://crates.io/crates/chrono) — screenshot filename timestamps
 - [`anyhow`](https://crates.io/crates/anyhow) — error handling
 
-Внешние API:
-- MyMemory Translation API (бесплатный, без ключа)
-- OCR.space Parse Image API (бесплатный, опциональный ключ)
+External services used:
+- MyMemory Translation API (free, no key required)
+- OCR.space Parse Image API (free, optional key)
 
 ---
 
-## Структура проекта / Project layout
+## Project layout
 
 ```
 src/
-├── main.rs            # точка входа, главный цикл сообщений, хоткеи
-├── settings.rs        # модель и загрузка/сохранение настроек
-├── settings_ui.rs     # кастомное окно настроек (owner-drawn)
-├── tray.rs            # системный трей (Shell_NotifyIcon)
-├── autostart.rs       # запись в HKCU Run для автозапуска
-├── autotype.rs        # авто-смена раскладки (Punto)
-├── layout.rs          # карта раскладок RU ↔ EN для Punto
-├── taskbar_center.rs  # центрирование иконок таскбара
-├── capture.rs         # выделение прямоугольной области экрана
-├── screenshot.rs      # захват пикселей и кодирование PNG
+├── main.rs            # entry point, main message loop, hotkey dispatch
+├── settings.rs        # settings model, JSON load/save
+├── settings_ui.rs     # custom owner-drawn dark settings window
+├── tray.rs            # system tray icon (Shell_NotifyIcon)
+├── autostart.rs       # Windows Registry Run key for autostart
+├── autotype.rs        # automatic Punto-style layout correction
+├── layout.rs          # RU ↔ EN keyboard layout maps for Punto
+├── taskbar_center.rs  # taskbar icon centering
+├── capture.rs         # rectangular screen-region selector overlay
+├── screenshot.rs      # pixel capture and PNG encoding
 ├── ocr.rs             # OCR.space + WinRT OCR
-├── translate.rs       # MyMemory API
-├── popup.rs           # всплывающее окно с переводом
-├── theme.rs           # цветовая палитра тёмной темы
+├── translate.rs       # MyMemory translation client
+├── popup.rs           # translation result popup window
+├── theme.rs           # dark theme color palette
 └── utils.rs           # UTF-16, urlencode, Win32 input helpers
 ```
 
 ---
 
-## Настройки / Settings location
+## Settings location
 
-Настройки сохраняются в
+Settings are persisted to
 `%APPDATA%\screen-translator\settings.json`.
-Удалите файл, чтобы сбросить к умолчаниям.
+Delete the file to reset everything to defaults.
 
 ---
 
-## Лицензия / License
+## License
 
 MIT

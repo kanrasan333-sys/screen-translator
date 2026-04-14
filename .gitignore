@@ -1,0 +1,41 @@
+# Rust build output
+/target/
+**/target/
+Cargo.lock.bak
+
+# User settings (contain personal folder paths)
+settings.json
+/screenshots/
+
+# IDE
+.vscode/
+.idea/
+*.iml
+.rustc_info.json
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Build artifacts
+*.pdb
+*.exe
+*.exp
+*.lib
+*.obj
+*.rlib
+*.rmeta
+
+# Env files (API keys, secrets)
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.bak
+*~

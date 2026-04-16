@@ -19,6 +19,7 @@ const IDC_HK_TRANSLATE: i32 = 101;
 const IDC_HK_OCR: i32 = 102;
 const IDC_HK_SCREENSHOT: i32 = 103;
 const IDC_HK_LAYOUT: i32 = 104;
+const IDC_HK_EXPLORER_CMD: i32 = 105;
 const IDC_EDIT_FOLDER: i32 = 106;
 const IDC_BTN_BROWSE: i32 = 107;
 const IDC_BTN_SAVE: i32 = 108;
@@ -27,6 +28,7 @@ const IDC_CHK_PUNTO: i32 = 110;
 const IDC_CHK_TASKBAR: i32 = 111;
 const IDC_CHK_AUTOSTART: i32 = 112;
 const IDC_COMBO_LANG: i32 = 114;
+const IDC_CHK_EXPLORER_CMD: i32 = 115;
 
 // Section header IDs (for accent coloring in WM_CTLCOLORSTATIC)
 const IDC_SEC_GENERAL: i32 = 200;
@@ -46,7 +48,7 @@ const CB_GETCURSEL: u32 = 0x0147;
 // ============================================================
 
 const WIN_W: i32 = 460;
-const WIN_H: i32 = 600;
+const WIN_H: i32 = 662;
 
 const MARGIN: i32 = 24;
 const LABEL_W: i32 = 186;
@@ -65,17 +67,17 @@ const Y_SEC_HK: i32 = 130;
 const Y_HK_START: i32 = 154;
 const HK_STEP: i32 = 32;
 
-const Y_SEP1: i32 = 282;
-const Y_SEC_FOLDER: i32 = 292;
-const Y_FOLDER: i32 = 316;
+const Y_SEP1: i32 = 314;
+const Y_SEC_FOLDER: i32 = 324;
+const Y_FOLDER: i32 = 348;
 const FOLDER_W: i32 = 330;
 
-const Y_SEP2: i32 = 354;
-const Y_SEC_FUNC: i32 = 364;
-const Y_CHK_START: i32 = 388;
+const Y_SEP2: i32 = 386;
+const Y_SEC_FUNC: i32 = 396;
+const Y_CHK_START: i32 = 420;
 const CHK_STEP: i32 = 28;
 
-const Y_BUTTONS: i32 = 496;
+const Y_BUTTONS: i32 = 558;
 const BTN_W: i32 = 140;
 const BTN_H: i32 = 38;
 const BTN_GAP: i32 = 16;
@@ -199,10 +201,11 @@ unsafe fn create_controls(parent: HWND, hinst: HINSTANCE, s: &Settings) {
 
         let hk_class = to_wide("msctls_hotkey32");
         let hotkeys: &[(&str, i32, &HotkeyConfig)] = &[
-            (i18n::t("settings.hotkey.translate"),  IDC_HK_TRANSLATE,  &s.hk_translate),
-            (i18n::t("settings.hotkey.ocr"),        IDC_HK_OCR,        &s.hk_ocr),
-            (i18n::t("settings.hotkey.screenshot"), IDC_HK_SCREENSHOT, &s.hk_screenshot),
-            (i18n::t("settings.hotkey.layout"),     IDC_HK_LAYOUT,     &s.hk_layout),
+            (i18n::t("settings.hotkey.translate"),    IDC_HK_TRANSLATE,    &s.hk_translate),
+            (i18n::t("settings.hotkey.ocr"),          IDC_HK_OCR,          &s.hk_ocr),
+            (i18n::t("settings.hotkey.screenshot"),   IDC_HK_SCREENSHOT,   &s.hk_screenshot),
+            (i18n::t("settings.hotkey.layout"),       IDC_HK_LAYOUT,       &s.hk_layout),
+            (i18n::t("settings.hotkey.explorer_cmd"), IDC_HK_EXPLORER_CMD, &s.hk_explorer_cmd),
         ];
 
         for (i, &(label, id, hk)) in hotkeys.iter().enumerate() {
@@ -249,6 +252,9 @@ unsafe fn create_controls(parent: HWND, hinst: HINSTANCE, s: &Settings) {
             i18n::t("settings.checkbox.taskbar"), IDC_CHK_TASKBAR, s.taskbar_center_enabled);
         create_checkbox(parent, hinst, font, MARGIN, Y_CHK_START + CHK_STEP * 2, 400, 22,
             i18n::t("settings.checkbox.autostart"), IDC_CHK_AUTOSTART, autostart::is_enabled());
+        create_checkbox(parent, hinst, font, MARGIN, Y_CHK_START + CHK_STEP * 3, 400, 22,
+            i18n::t("settings.checkbox.explorer_cmd"), IDC_CHK_EXPLORER_CMD,
+            crate::explorer_cmd::is_menu_enabled());
 
         // ── Buttons ──
         let bx = (WIN_W - BTN_W * 2 - BTN_GAP) / 2;
@@ -516,7 +522,7 @@ unsafe fn paint(hwnd: HWND) {
         let old_brush = SelectObject(hdc, fill_brush);
 
         // Hotkey field borders
-        for i in 0..4 {
+        for i in 0..5 {
             let y = Y_HK_START + i * HK_STEP;
             let _ = RoundRect(hdc,
                 INPUT_X - 2, y - 2,
@@ -583,6 +589,7 @@ unsafe extern "system" fn settings_proc(
                             hk_ocr: read_hotkey(hwnd, IDC_HK_OCR),
                             hk_screenshot: read_hotkey(hwnd, IDC_HK_SCREENSHOT),
                             hk_layout: read_hotkey(hwnd, IDC_HK_LAYOUT),
+                            hk_explorer_cmd: read_hotkey(hwnd, IDC_HK_EXPLORER_CMD),
                             screenshot_folder: read_folder(hwnd),
                             punto_enabled: read_checkbox(hwnd, IDC_CHK_PUNTO),
                             taskbar_center_enabled: read_checkbox(hwnd, IDC_CHK_TASKBAR),
@@ -591,6 +598,10 @@ unsafe extern "system" fn settings_proc(
 
                         // Autostart → registry
                         autostart::set_enabled(read_checkbox(hwnd, IDC_CHK_AUTOSTART));
+
+                        // Explorer "Open CMD here" context-menu → registry
+                        crate::explorer_cmd::set_menu_enabled(
+                            read_checkbox(hwnd, IDC_CHK_EXPLORER_CMD));
 
                         settings::save(&new_settings);
                         *UPDATED_SETTINGS.lock().unwrap() = Some(Box::new(new_settings));

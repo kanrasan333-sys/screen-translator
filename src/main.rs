@@ -3,6 +3,7 @@
 mod autostart;
 mod autotype;
 mod capture;
+mod explorer_cmd;
 mod i18n;
 mod layout;
 mod ocr;
@@ -38,8 +39,9 @@ const HOTKEY_LAYOUT: i32 = 4;
 const HOTKEY_SETTINGS: i32 = 5;
 const HOTKEY_AUTOTYPE: i32 = 6;
 const HOTKEY_TASKBAR_CENTER: i32 = 7;
+const HOTKEY_EXPLORER_CMD: i32 = 8;
 
-const ALL_HOTKEY_IDS: [i32; 7] = [
+const ALL_HOTKEY_IDS: [i32; 8] = [
     HOTKEY_TRANSLATE,
     HOTKEY_OCR,
     HOTKEY_SCREENSHOT,
@@ -47,6 +49,7 @@ const ALL_HOTKEY_IDS: [i32; 7] = [
     HOTKEY_SETTINGS,
     HOTKEY_AUTOTYPE,
     HOTKEY_TASKBAR_CENTER,
+    HOTKEY_EXPLORER_CMD,
 ];
 
 // ============================================================
@@ -175,6 +178,7 @@ fn dispatch_hotkey(id: i32) {
         HOTKEY_SETTINGS => handle_settings(),
         HOTKEY_AUTOTYPE => handle_autotype_toggle(),
         HOTKEY_TASKBAR_CENTER => handle_taskbar_center_toggle(),
+        HOTKEY_EXPLORER_CMD => handle_explorer_cmd(),
         _ => {}
     }
 }
@@ -192,6 +196,7 @@ fn register_hotkeys(s: &settings::Settings) {
         reg(HOTKEY_OCR, &s.hk_ocr);
         reg(HOTKEY_SCREENSHOT, &s.hk_screenshot);
         reg(HOTKEY_LAYOUT, &s.hk_layout);
+        reg(HOTKEY_EXPLORER_CMD, &s.hk_explorer_cmd);
         // Settings: always Ctrl+Alt+O
         let _ = RegisterHotKey(None, HOTKEY_SETTINGS, HOT_KEY_MODIFIERS(0x0003), 0x4F);
         // Autotype toggle: always Ctrl+Alt+A
@@ -438,6 +443,11 @@ fn handle_taskbar_center_toggle() {
     let msg = i18n::t(if enabled { "popup.taskbar_on" } else { "popup.taskbar_off" });
     println!("[*] {msg}");
     popup::show("", msg, "info");
+}
+
+fn handle_explorer_cmd() {
+    println!("[*] Opening CMD in active Explorer folder...");
+    explorer_cmd::open_in_active_folder();
 }
 
 fn copy_to_clipboard(pixels: &[u8], width: u32, height: u32) {

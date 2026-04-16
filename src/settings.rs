@@ -13,6 +13,9 @@ pub struct Settings {
     pub hk_ocr: HotkeyConfig,
     pub hk_screenshot: HotkeyConfig,
     pub hk_layout: HotkeyConfig,
+    /// "Open CMD in active Explorer folder" hotkey.
+    #[serde(default = "default_hk_explorer_cmd")]
+    pub hk_explorer_cmd: HotkeyConfig,
     pub screenshot_folder: String,
     #[serde(default = "yes")]
     pub punto_enabled: bool,
@@ -25,6 +28,9 @@ pub struct Settings {
 
 fn yes() -> bool { true }
 fn default_lang() -> String { "en".to_string() }
+fn default_hk_explorer_cmd() -> HotkeyConfig {
+    HotkeyConfig { modifiers: 0x0003, vk: 0x4B } // Ctrl+Alt+K
+}
 
 impl Settings {
     /// Compile-time default for `static Mutex<Settings>` initialisation.
@@ -33,6 +39,7 @@ impl Settings {
         hk_ocr: HotkeyConfig { modifiers: 0x0003, vk: 0x53 },       // Ctrl+Alt+S
         hk_screenshot: HotkeyConfig { modifiers: 0x0003, vk: 0x44 }, // Ctrl+Alt+D
         hk_layout: HotkeyConfig { modifiers: 0x0003, vk: 0x4C },    // Ctrl+Alt+L
+        hk_explorer_cmd: HotkeyConfig { modifiers: 0x0003, vk: 0x4B }, // Ctrl+Alt+K
         screenshot_folder: String::new(),
         punto_enabled: true,
         taskbar_center_enabled: true,

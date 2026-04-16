@@ -102,30 +102,43 @@ unsafe extern "system" fn hook_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESUL
         let fg = GetForegroundWindow();
         let tid = GetWindowThreadProcessId(fg, None);
         let layout = GetKeyboardLayout(tid);
-        let is_russian = (layout.0 as usize & 0xFFFF) == 0x0419;
+        let layout_id = layout.0 as usize & 0xFFFF;
+        let kbd = match layout_id {
+            0x0419 => Kbd::Russian,
+            0x0422 => Kbd::Ukrainian,
+            _ => Kbd::Latin,
+        };
+        let is_cyrillic_layout = !matches!(kbd, Kbd::Latin);
 
         match vk {
             // Letters A-Z (layout-independent VK codes)
             0x41..=0x5A => {
-                if let Some(ch) = vk_to_char(vk, shift, caps, is_russian) {
+                if let Some(ch) = vk_to_char(vk, shift, caps, kbd) {
                     WORD_BUF.lock().unwrap().push(ch);
                 }
             }
-            // OEM keys that produce Cyrillic LETTERS on Russian layout:
+            // OEM keys that produce Cyrillic LETTERS on Russian/Ukrainian layouts:
             //   OEM_1(;)→ж  OEM_COMMA(,)→б  OEM_PERIOD(.)→ю
-            //   OEM_4([)→х  OEM_6(])→ъ  OEM_7(')→э  OEM_3(`)→ё
+            //   OEM_4([)→х
+            //   OEM_6(])→ъ (RU) / ї (UK)
+            //   OEM_7(')→э (RU) / є (UK)
+            //   OEM_3(`)→ё (RU) / ' apostrophe (UK, boundary-like, skipped)
             0xBA | 0xBC | 0xBE | 0xDB | 0xDD | 0xDE | 0xC0
-                if is_russian =>
+                if is_cyrillic_layout =>
             {
-                if let Some(ch) = oem_to_ru_char(vk, shift, caps) {
+                if let Some(ch) = oem_to_cyr_char(vk, shift, caps, kbd) {
                     WORD_BUF.lock().unwrap().push(ch);
+                } else {
+                    // Unmapped OEM on this layout → treat as boundary
+                    let ch = oem_boundary_char(vk, shift, is_cyrillic_layout);
+                    check_word_boundary(ch);
                 }
             }
             // OEM keys as punctuation (English layout, or keys that stay
             // punctuation in Russian: OEM_2(/?)→.,  OEM_5(\|)  OEM_PLUS  OEM_MINUS)
             0xBA | 0xBC | 0xBE | 0xDB | 0xDD | 0xDE | 0xC0 |
             0xBF | 0xDC | 0xBB | 0xBD => {
-                let ch = oem_boundary_char(vk, shift, is_russian);
+                let ch = oem_boundary_char(vk, shift, is_cyrillic_layout);
                 check_word_boundary(ch);
             }
             // Space, Tab — word boundary
@@ -268,6 +281,12 @@ fn decide_switch(word: &str) -> Option<String> {
 
     // Mixed scripts — never touch.
     if has_latin && has_cyrillic { return None; }
+
+    // Ukrainian-specific letters (і, ї, є, ґ + uppercase) are a strong signal
+    // that the user is intentionally typing Ukrainian. Don't "correct" these
+    // into Russian or English — they have no clean mapping in either direction
+    // and such a swap would always be unwanted.
+    if word.chars().any(is_ukrainian_only) { return None; }
 
     let converted = crate::layout::convert(word);
     let word_lc = word.to_lowercase();
@@ -850,21 +869,40 @@ fn is_ru_vowel(c: char) -> bool {
     matches!(c, 'а' | 'е' | 'ё' | 'и' | 'о' | 'у' | 'ы' | 'э' | 'ю' | 'я')
 }
 
-fn vk_to_char(vk: u32, shift: bool, caps: bool, is_russian: bool) -> Option<char> {
+/// Cyrillic letters that exist in Ukrainian but NOT in Russian.
+/// Their presence is a strong signal the word is intentionally Ukrainian.
+fn is_ukrainian_only(c: char) -> bool {
+    matches!(c, 'і' | 'І' | 'ї' | 'Ї' | 'є' | 'Є' | 'ґ' | 'Ґ')
+}
+
+/// Active keyboard layout category.  Only layouts we handle natively get
+/// their own variant; everything else falls into `Latin` (no translation).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kbd {
+    Latin,
+    Russian,
+    Ukrainian,
+}
+
+fn vk_to_char(vk: u32, shift: bool, caps: bool, kbd: Kbd) -> Option<char> {
     if !(0x41..=0x5A).contains(&vk) { return None; }
     let c = (vk as u8) as char;
     // CapsLock inverts the shift behaviour.
     let upper = shift ^ caps;
     let en = if upper { c } else { c.to_ascii_lowercase() };
-    if is_russian { Some(crate::layout::en_to_ru(en)) } else { Some(en) }
+    Some(match kbd {
+        Kbd::Russian => crate::layout::en_to_ru(en),
+        Kbd::Ukrainian => crate::layout::en_to_uk(en),
+        Kbd::Latin => en,
+    })
 }
 
 /// Maps OEM VK codes to their punctuation character for the boundary replacement.
 /// Used when OEM keys are treated as word boundaries (English layout, or
-/// non-letter OEM keys in Russian layout).
-fn oem_boundary_char(vk: u32, shift: bool, is_russian: bool) -> Option<char> {
-    if is_russian {
-        // Russian layout: only a few OEM keys produce punctuation
+/// non-letter OEM keys in Cyrillic layout).
+fn oem_boundary_char(vk: u32, shift: bool, is_cyrillic_layout: bool) -> Option<char> {
+    if is_cyrillic_layout {
+        // Cyrillic layouts: only a few OEM keys produce punctuation
         Some(match (vk, shift) {
             (0xBF, false) => '.', // OEM_2 → .
             (0xBF, true)  => ',', // OEM_2 + Shift → ,
@@ -895,24 +933,31 @@ fn oem_boundary_char(vk: u32, shift: bool, is_russian: bool) -> Option<char> {
     }
 }
 
-/// Maps OEM VK codes to Russian Cyrillic letters.
-/// Standard Russian keyboard:
-///   OEM_3(`)→ё  OEM_4([)→х  OEM_6(])→ъ  OEM_1(;)→ж
-///   OEM_7(')→э  OEM_COMMA(,)→б  OEM_PERIOD(.)→ю
-fn oem_to_ru_char(vk: u32, shift: bool, caps: bool) -> Option<char> {
+/// Maps OEM VK codes to Cyrillic letters for the active layout.
+///   Russian:    OEM_3(`)→ё  OEM_4([)→х  OEM_6(])→ъ  OEM_1(;)→ж
+///               OEM_7(')→э  OEM_COMMA(,)→б  OEM_PERIOD(.)→ю
+///   Ukrainian:  OEM_3(`)→' (apostrophe — NOT a letter, caller treats as boundary)
+///               OEM_4([)→х  OEM_6(])→ї  OEM_1(;)→ж
+///               OEM_7(')→є  OEM_COMMA(,)→б  OEM_PERIOD(.)→ю
+fn oem_to_cyr_char(vk: u32, shift: bool, caps: bool, kbd: Kbd) -> Option<char> {
     let upper = shift ^ caps;
-    let ch = match vk {
-        0xC0 => 'ё', // OEM_3 (backtick/tilde)
-        0xDB => 'х', // OEM_4 (left bracket)
-        0xDD => 'ъ', // OEM_6 (right bracket)
-        0xBA => 'ж', // OEM_1 (semicolon)
-        0xDE => 'э', // OEM_7 (apostrophe)
-        0xBC => 'б', // OEM_COMMA
-        0xBE => 'ю', // OEM_PERIOD
+    let ch = match (kbd, vk) {
+        (Kbd::Russian, 0xC0) => 'ё',
+        (Kbd::Russian, 0xDD) => 'ъ',
+        (Kbd::Russian, 0xDE) => 'э',
+        (Kbd::Ukrainian, 0xDD) => 'ї',
+        (Kbd::Ukrainian, 0xDE) => 'є',
+        // Ukrainian OEM_3 is a literal apostrophe (boundary-like) — bail out
+        // so caller treats it as punctuation/word separator.
+        (Kbd::Ukrainian, 0xC0) => return None,
+        // Shared letters between RU and UK layouts:
+        (Kbd::Russian | Kbd::Ukrainian, 0xDB) => 'х',
+        (Kbd::Russian | Kbd::Ukrainian, 0xBA) => 'ж',
+        (Kbd::Russian | Kbd::Ukrainian, 0xBC) => 'б',
+        (Kbd::Russian | Kbd::Ukrainian, 0xBE) => 'ю',
         _ => return None,
     };
     if upper {
-        // Cyrillic uppercase
         Some(ch.to_uppercase().next().unwrap_or(ch))
     } else {
         Some(ch)
@@ -1032,6 +1077,53 @@ mod tests {
     fn keeps_mixed_scripts_untouched() {
         should_not_switch("hello мир");
         should_not_switch("приветworld");
+    }
+
+    // --- Ukrainian: words with UK-specific chars must never switch ---
+
+    #[test]
+    fn keeps_ukrainian_privit() {
+        // "привіт" contains 'і' — Ukrainian-only. Must NOT become "привыт".
+        should_not_switch("привіт");
+    }
+
+    #[test]
+    fn keeps_ukrainian_with_yi() {
+        // "її" — Ukrainian "her/hers" / reflexive. Has 'ї'.
+        should_not_switch("її");
+        should_not_switch("їжа");       // food
+        should_not_switch("україна");   // country name
+    }
+
+    #[test]
+    fn keeps_ukrainian_with_ye() {
+        should_not_switch("є");          // "is/am/are"
+        should_not_switch("єдиний");     // only/single
+    }
+
+    #[test]
+    fn keeps_ukrainian_with_g() {
+        should_not_switch("ґанок");      // porch
+    }
+
+    #[test]
+    fn keeps_uppercase_ukrainian_chars() {
+        should_not_switch("Їжак");
+        should_not_switch("ІВАН");
+    }
+
+    // --- Latin word that would "convert" into Ukrainian still works fine ---
+    // (No change expected — Latin→Cyrillic goes to Russian, never Ukrainian,
+    // so Ukrainian-guard is not triggered on the input; guard runs first.)
+
+    #[test]
+    fn ukrainian_guard_runs_before_conversion() {
+        // Even if some scoring heuristic would otherwise decide to switch,
+        // the UK-letter guard short-circuits. This covers future scoring
+        // changes that might accidentally weaken the safeguard.
+        let uk = "привіт";
+        assert!(uk.chars().any(is_ukrainian_only));
+        should_not_switch(uk);
     }
 
     // --- Whitelists must stay sorted for binary_search ---

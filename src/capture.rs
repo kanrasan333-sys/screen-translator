@@ -29,9 +29,35 @@ enum Phase { Selecting, Toolbar }
 #[derive(PartialEq, Clone, Copy)]
 enum Action { None, Translate, Save, Clipboard, Cancel }
 
+/// Eight resize handles around the selection rect.  Compass directions
+/// (NW = top-left, SE = bottom-right, etc.) map cleanly to what the
+/// cursor and drag behaviour should do.
+#[derive(PartialEq, Clone, Copy)]
+enum Handle { NW, N, NE, E, SE, S, SW, W }
+
+impl Handle {
+    fn all() -> &'static [Handle] {
+        &[Handle::NW, Handle::N, Handle::NE, Handle::E,
+          Handle::SE, Handle::S, Handle::SW, Handle::W]
+    }
+    fn cursor(self) -> windows::core::PCWSTR {
+        match self {
+            Handle::NW | Handle::SE => IDC_SIZENWSE,
+            Handle::NE | Handle::SW => IDC_SIZENESW,
+            Handle::N  | Handle::S  => IDC_SIZENS,
+            Handle::E  | Handle::W  => IDC_SIZEWE,
+        }
+    }
+}
+
+/// Size of each resize-handle square in pixels.
+const HANDLE_SIZE: i32 = 10;
+
 struct OverlayState {
     phase: Phase,
     dragging: bool,
+    /// Set while the user is dragging one of the eight handles.
+    resizing: Option<Handle>,
     start_x: i32,
     start_y: i32,
     end_x: i32,
@@ -42,7 +68,7 @@ struct OverlayState {
 impl OverlayState {
     const fn new() -> Self {
         Self {
-            phase: Phase::Selecting, dragging: false,
+            phase: Phase::Selecting, dragging: false, resizing: None,
             start_x: 0, start_y: 0, end_x: 0, end_y: 0,
             action: Action::None,
         }
@@ -55,6 +81,46 @@ impl OverlayState {
         let h = (self.start_y - self.end_y).abs();
         (x, y, w, h)
     }
+    /// Re-assign start/end so start is the top-left, end is the bottom-right.
+    /// Called on resize start so the per-handle update rules below have a
+    /// stable frame to work in.
+    fn normalize(&mut self) {
+        let (rx, ry, rw, rh) = self.rect();
+        self.start_x = rx;
+        self.start_y = ry;
+        self.end_x   = rx + rw;
+        self.end_y   = ry + rh;
+    }
+}
+
+/// Rect of a single resize handle centred on the appropriate edge/corner.
+fn handle_rect(rx: i32, ry: i32, rw: i32, rh: i32, h: Handle) -> RECT {
+    let half = HANDLE_SIZE / 2;
+    let (cx, cy) = match h {
+        Handle::NW => (rx,          ry),
+        Handle::N  => (rx + rw / 2, ry),
+        Handle::NE => (rx + rw,     ry),
+        Handle::E  => (rx + rw,     ry + rh / 2),
+        Handle::SE => (rx + rw,     ry + rh),
+        Handle::S  => (rx + rw / 2, ry + rh),
+        Handle::SW => (rx,          ry + rh),
+        Handle::W  => (rx,          ry + rh / 2),
+    };
+    RECT {
+        left: cx - half, top: cy - half,
+        right: cx - half + HANDLE_SIZE, bottom: cy - half + HANDLE_SIZE,
+    }
+}
+
+/// Which handle (if any) the point falls inside.
+fn handle_at(x: i32, y: i32, rx: i32, ry: i32, rw: i32, rh: i32) -> Option<Handle> {
+    for h in Handle::all() {
+        let r = handle_rect(rx, ry, rw, rh, *h);
+        if x >= r.left && x < r.right && y >= r.top && y < r.bottom {
+            return Some(*h);
+        }
+    }
+    None
 }
 
 static STATE: Mutex<OverlayState> = Mutex::new(OverlayState::new());
@@ -64,12 +130,20 @@ static STATE: Mutex<OverlayState> = Mutex::new(OverlayState::new());
 // ============================================================
 
 struct ScreenCapture {
+    x: i32,
+    y: i32,
     orig_dc: isize,
     orig_bmp: isize,
     orig_old: isize,
     dim_dc: isize,
     dim_bmp: isize,
     dim_old: isize,
+    /// Back buffer — paint the whole scene here first, then BitBlt in one
+    /// pass to the window.  Kills the flicker that came from painting
+    /// dim → selection → border directly to the visible HDC.
+    back_dc: isize,
+    back_bmp: isize,
+    back_old: isize,
     width: i32,
     height: i32,
 }
@@ -78,14 +152,16 @@ static SCREEN_CAP: Mutex<Option<ScreenCapture>> = Mutex::new(None);
 fn init_screen_capture() {
     unsafe {
         let screen_dc = GetDC(None);
-        let sw = GetSystemMetrics(SM_CXSCREEN);
-        let sh = GetSystemMetrics(SM_CYSCREEN);
+        let sx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        let sy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        let sw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        let sh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
 
         // Original screenshot.
         let orig_dc = CreateCompatibleDC(screen_dc);
         let orig_bmp = CreateCompatibleBitmap(screen_dc, sw, sh);
         let orig_old = SelectObject(orig_dc, orig_bmp);
-        let _ = BitBlt(orig_dc, 0, 0, sw, sh, screen_dc, 0, 0, SRCCOPY);
+        let _ = BitBlt(orig_dc, 0, 0, sw, sh, screen_dc, sx, sy, SRCCOPY);
 
         // Dimmed copy.
         let dim_dc = CreateCompatibleDC(screen_dc);
@@ -106,13 +182,25 @@ fn init_screen_capture() {
         SelectObject(black_dc, black_old);
         let _ = DeleteObject(black_bmp);
         let _ = DeleteDC(black_dc);
+
+        // Back buffer — same size as the overlay.  Allocated once per
+        // capture session so every WM_PAINT reuses it rather than churning
+        // GDI objects on each mouse move.
+        let back_dc = CreateCompatibleDC(screen_dc);
+        let back_bmp = CreateCompatibleBitmap(screen_dc, sw, sh);
+        let back_old = SelectObject(back_dc, back_bmp);
+
         ReleaseDC(None, screen_dc);
 
         *SCREEN_CAP.lock().unwrap() = Some(ScreenCapture {
+            x: sx,
+            y: sy,
             orig_dc: orig_dc.0 as isize, orig_bmp: orig_bmp.0 as isize,
             orig_old: orig_old.0 as isize,
             dim_dc: dim_dc.0 as isize, dim_bmp: dim_bmp.0 as isize,
             dim_old: dim_old.0 as isize,
+            back_dc: back_dc.0 as isize, back_bmp: back_bmp.0 as isize,
+            back_old: back_old.0 as isize,
             width: sw, height: sh,
         });
     }
@@ -130,15 +218,25 @@ fn cleanup_screen_capture() {
             SelectObject(dim_dc, HGDIOBJ(c.dim_old as *mut _));
             let _ = DeleteObject(HGDIOBJ(c.dim_bmp as *mut _));
             let _ = DeleteDC(dim_dc);
+
+            let back_dc = HDC(c.back_dc as *mut _);
+            SelectObject(back_dc, HGDIOBJ(c.back_old as *mut _));
+            let _ = DeleteObject(HGDIOBJ(c.back_bmp as *mut _));
+            let _ = DeleteDC(back_dc);
         }
     }
 }
 
-fn screen_dimensions() -> (i32, i32) {
+fn screen_bounds() -> (i32, i32, i32, i32) {
     SCREEN_CAP.lock().unwrap().as_ref()
-        .map(|c| (c.width, c.height))
+        .map(|c| (c.x, c.y, c.width, c.height))
         .unwrap_or_else(|| unsafe {
-            (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN))
+            (
+                GetSystemMetrics(SM_XVIRTUALSCREEN),
+                GetSystemMetrics(SM_YVIRTUALSCREEN),
+                GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                GetSystemMetrics(SM_CYVIRTUALSCREEN),
+            )
         })
 }
 
@@ -314,12 +412,12 @@ fn create_overlay() -> Option<HWND> {
         };
         RegisterClassW(&wc);
 
-        let (sw, sh) = screen_dimensions();
+        let (sx, sy, sw, sh) = screen_bounds();
 
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
             class, w!(""), WS_POPUP | WS_VISIBLE,
-            0, 0, sw, sh,
+            sx, sy, sw, sh,
             HWND::default(), HMENU::default(), hinstance, None,
         ).ok()?;
 
@@ -359,34 +457,88 @@ unsafe extern "system" fn overlay_proc(
                     }
                     Phase::Toolbar => {
                         let (rx, ry, rw, rh) = s.rect();
-                        let (_, screen_h) = screen_dimensions();
-                        drop(s);
-                        let (btn_tr, btn_save) = toolbar_buttons(rx, ry, rw, rh, screen_h);
-
-                        if point_in_btn(x, y, &btn_tr) {
-                            STATE.lock().unwrap().action = Action::Translate;
-                        } else if point_in_btn(x, y, &btn_save) {
-                            STATE.lock().unwrap().action = Action::Save;
+                        // Handle-first: grab a handle over hitting toolbar /
+                        // cancelling.  Matches expected WYSIWYG behaviour.
+                        if let Some(h) = handle_at(x, y, rx, ry, rw, rh) {
+                            s.normalize();
+                            s.resizing = Some(h);
+                            drop(s);
+                            SetCapture(hwnd);
                         } else {
-                            STATE.lock().unwrap().action = Action::Cancel;
+                            let (_, _, _, screen_h) = screen_bounds();
+                            drop(s);
+                            let (btn_tr, btn_save) =
+                                toolbar_buttons(rx, ry, rw, rh, screen_h);
+
+                            if point_in_btn(x, y, &btn_tr) {
+                                STATE.lock().unwrap().action = Action::Translate;
+                            } else if point_in_btn(x, y, &btn_save) {
+                                STATE.lock().unwrap().action = Action::Save;
+                            } else {
+                                STATE.lock().unwrap().action = Action::Cancel;
+                            }
+                            signal_close();
                         }
-                        signal_close();
                     }
                 }
                 LRESULT(0)
             }
             WM_MOUSEMOVE => {
                 let mut s = STATE.lock().unwrap();
+                let (x, y) = lparam_to_point(lp);
                 if s.dragging && s.phase == Phase::Selecting {
-                    let (x, y) = lparam_to_point(lp);
                     s.end_x = x; s.end_y = y;
+                    drop(s);
+                    let _ = InvalidateRect(hwnd, None, false);
+                } else if let Some(h) = s.resizing {
+                    // start_* = top-left, end_* = bottom-right (we normalised
+                    // on mouse-down).  Update only the edges the grabbed
+                    // handle owns.
+                    match h {
+                        Handle::NW => { s.start_x = x; s.start_y = y; }
+                        Handle::N  => { s.start_y = y; }
+                        Handle::NE => { s.start_y = y; s.end_x = x; }
+                        Handle::E  => { s.end_x = x; }
+                        Handle::SE => { s.end_x = x; s.end_y = y; }
+                        Handle::S  => { s.end_y = y; }
+                        Handle::SW => { s.start_x = x; s.end_y = y; }
+                        Handle::W  => { s.start_x = x; }
+                    }
                     drop(s);
                     let _ = InvalidateRect(hwnd, None, false);
                 }
                 LRESULT(0)
             }
+            WM_SETCURSOR => {
+                // Show a resize cursor while hovering a handle (or resizing).
+                let s = STATE.lock().unwrap();
+                let phase = s.phase;
+                let resizing = s.resizing;
+                let (rx, ry, rw, rh) = s.rect();
+                drop(s);
+
+                if let Some(h) = resizing {
+                    let _ = SetCursor(LoadCursorW(None, h.cursor()).unwrap_or_default());
+                    return LRESULT(1);
+                }
+                if phase == Phase::Toolbar {
+                    let mut pt = POINT::default();
+                    if GetCursorPos(&mut pt).is_ok() {
+                        let _ = ScreenToClient(hwnd, &mut pt);
+                        if let Some(h) = handle_at(pt.x, pt.y, rx, ry, rw, rh) {
+                            let _ = SetCursor(
+                                LoadCursorW(None, h.cursor()).unwrap_or_default()
+                            );
+                            return LRESULT(1);
+                        }
+                    }
+                }
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
             WM_LBUTTONUP => {
-                if STATE.lock().unwrap().phase == Phase::Selecting {
+                let mut s = STATE.lock().unwrap();
+                if s.dragging && s.phase == Phase::Selecting {
+                    drop(s);
                     let _ = ReleaseCapture();
                     let (x, y) = lparam_to_point(lp);
                     let mut s = STATE.lock().unwrap();
@@ -403,6 +555,14 @@ unsafe extern "system" fn overlay_proc(
                         drop(s);
                         let _ = InvalidateRect(hwnd, None, false);
                     }
+                } else if s.resizing.is_some() {
+                    s.resizing = None;
+                    // Rebuild (start=NW, end=SE) in case the handle was dragged
+                    // past the opposite edge (flip).
+                    s.normalize();
+                    drop(s);
+                    let _ = ReleaseCapture();
+                    let _ = InvalidateRect(hwnd, None, false);
                 }
                 LRESULT(0)
             }
@@ -447,10 +607,15 @@ unsafe extern "system" fn overlay_proc(
 
 unsafe fn paint_overlay(hdc: HDC) {
     unsafe {
-        let (orig_dc, dim_dc, sw, sh) = {
+        let (orig_dc, dim_dc, back_dc, sw, sh) = {
             let cap = SCREEN_CAP.lock().unwrap();
             let Some(c) = cap.as_ref() else { return };
-            (HDC(c.orig_dc as *mut _), HDC(c.dim_dc as *mut _), c.width, c.height)
+            (
+                HDC(c.orig_dc as *mut _),
+                HDC(c.dim_dc as *mut _),
+                HDC(c.back_dc as *mut _),
+                c.width, c.height,
+            )
         };
 
         let s = STATE.lock().unwrap();
@@ -461,31 +626,56 @@ unsafe fn paint_overlay(hdc: HDC) {
 
         let has_selection = (dragging || phase == Phase::Toolbar) && rw > 2 && rh > 2;
 
+        // Compose the whole scene into the back buffer first, then blit it
+        // out as a single op.  Drawing straight to `hdc` in multiple passes
+        // (dim → selection → border → badge → buttons) used to flash
+        // during rapid mouse moves.
         if has_selection {
-            let _ = BitBlt(hdc, 0, 0, sw, sh, dim_dc, 0, 0, SRCCOPY);
-            let _ = BitBlt(hdc, rx, ry, rw, rh, orig_dc, rx, ry, SRCCOPY);
+            let _ = BitBlt(back_dc, 0, 0, sw, sh, dim_dc, 0, 0, SRCCOPY);
+            let _ = BitBlt(back_dc, rx, ry, rw, rh, orig_dc, rx, ry, SRCCOPY);
 
-            // Selection border.
             let pen = CreatePen(PS_SOLID, 2, COLORREF(theme::CLR_ACCENT));
-            let old_pen = SelectObject(hdc, pen);
-            let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-            let _ = Rectangle(hdc, rx, ry, rx + rw, ry + rh);
-            SelectObject(hdc, old_pen);
-            SelectObject(hdc, old_brush);
+            let old_pen = SelectObject(back_dc, pen);
+            let old_brush = SelectObject(back_dc, GetStockObject(NULL_BRUSH));
+            let _ = Rectangle(back_dc, rx, ry, rx + rw, ry + rh);
+            SelectObject(back_dc, old_pen);
+            SelectObject(back_dc, old_brush);
             let _ = DeleteObject(pen);
 
-            draw_size_badge(hdc, rx, ry, rw, rh);
+            draw_size_badge(back_dc, rx, ry, rw, rh);
 
             if phase == Phase::Toolbar {
+                draw_resize_handles(back_dc, rx, ry, rw, rh);
                 let (btn_tr, btn_save) = toolbar_buttons(rx, ry, rw, rh, sh);
-                draw_button(hdc, &btn_tr, i18n::t("capture.btn.translate"), true);
-                draw_button(hdc, &btn_save, i18n::t("capture.btn.save"), false);
-                draw_hint(hdc, rx, ry, rw, rh, sh);
+                draw_button(back_dc, &btn_tr, i18n::t("capture.btn.translate"), true);
+                draw_button(back_dc, &btn_save, i18n::t("capture.btn.save"), false);
+                draw_hint(back_dc, rx, ry, rw, rh, sh);
             }
         } else {
-            let _ = BitBlt(hdc, 0, 0, sw, sh, dim_dc, 0, 0, SRCCOPY);
-            draw_initial_hint(hdc, sw, sh);
+            let _ = BitBlt(back_dc, 0, 0, sw, sh, dim_dc, 0, 0, SRCCOPY);
+            draw_initial_hint(back_dc, sw, sh);
         }
+
+        // Single blit to the visible surface — the one frame the user
+        // actually sees.
+        let _ = BitBlt(hdc, 0, 0, sw, sh, back_dc, 0, 0, SRCCOPY);
+    }
+}
+
+unsafe fn draw_resize_handles(hdc: HDC, rx: i32, ry: i32, rw: i32, rh: i32) {
+    unsafe {
+        let fill = CreateSolidBrush(COLORREF(0x00FF_FFFF));
+        let pen  = CreatePen(PS_SOLID, 1, COLORREF(theme::CLR_ACCENT));
+        let op = SelectObject(hdc, pen);
+        let ob = SelectObject(hdc, fill);
+        for h in Handle::all() {
+            let r = handle_rect(rx, ry, rw, rh, *h);
+            let _ = Rectangle(hdc, r.left, r.top, r.right, r.bottom);
+        }
+        SelectObject(hdc, op);
+        SelectObject(hdc, ob);
+        let _ = DeleteObject(fill);
+        let _ = DeleteObject(pen);
     }
 }
 

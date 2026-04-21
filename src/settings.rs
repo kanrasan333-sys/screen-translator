@@ -57,41 +57,47 @@ impl Default for Settings {
 
 impl HotkeyConfig {
     pub fn display(&self) -> String {
-        let mut parts = Vec::new();
-        if self.modifiers & 0x0002 != 0 { parts.push("Ctrl"); }
-        if self.modifiers & 0x0001 != 0 { parts.push("Alt"); }
-        if self.modifiers & 0x0004 != 0 { parts.push("Shift"); }
+        let mut parts: Vec<String> = Vec::new();
+        if self.modifiers & 0x0002 != 0 { parts.push("Ctrl".into()); }
+        if self.modifiers & 0x0001 != 0 { parts.push("Alt".into()); }
+        if self.modifiers & 0x0004 != 0 { parts.push("Shift".into()); }
         let key = match self.vk {
-            0x41..=0x5A => {
-                let c = (self.vk as u8) as char;
-                return format!("{}+{c}", parts.join("+"));
-            }
-            0x70..=0x87 => {
-                let n = self.vk - 0x70 + 1;
-                return format!("{}+F{n}", parts.join("+"));
-            }
+            0x41..=0x5A => ((self.vk as u8) as char).to_string(),
+            0x70..=0x87 => format!("F{}", self.vk - 0x70 + 1),
+            0x08 => "Backspace".into(),
+            0x09 => "Tab".into(),
+            0x0D => "Enter".into(),
+            0x1B => "Esc".into(),
+            0x20 => "Space".into(),
+            0x21 => "PgUp".into(),
+            0x22 => "PgDn".into(),
+            0x23 => "End".into(),
+            0x24 => "Home".into(),
+            0x25 => "Left".into(),
+            0x26 => "Up".into(),
+            0x27 => "Right".into(),
+            0x28 => "Down".into(),
+            0x2D => "Ins".into(),
+            0x2E => "Del".into(),
+            0x30..=0x39 => ((self.vk as u8) as char).to_string(),
+            0x6F => "/".into(),
+            0xBA => ";".into(),
+            0xBB => "=".into(),
+            0xBC => ",".into(),
+            0xBD => "-".into(),
+            0xBE => ".".into(),
+            0xBF => "/".into(),
+            0xC0 => "`".into(),
+            0xDB => "[".into(),
+            0xDC => "\\".into(),
+            0xDD => "]".into(),
+            0xDE => "'".into(),
             _ => format!("0x{:02X}", self.vk),
         };
-        format!("{}+{key}", parts.join("+"))
+        parts.push(key);
+        parts.join("+")
     }
 
-    /// Конвертирует из формата HOTKEY_CLASS (HOTKEYF_*) в RegisterHotKey (MOD_*)
-    pub fn from_hotkey_ctrl(vk: u32, hk_mods: u32) -> Self {
-        let mut mods = 0u32;
-        if hk_mods & 0x02 != 0 { mods |= 0x0002; } // HOTKEYF_CONTROL -> MOD_CONTROL
-        if hk_mods & 0x04 != 0 { mods |= 0x0001; } // HOTKEYF_ALT -> MOD_ALT
-        if hk_mods & 0x01 != 0 { mods |= 0x0004; } // HOTKEYF_SHIFT -> MOD_SHIFT
-        Self { modifiers: mods, vk }
-    }
-
-    /// Конвертирует в формат HOTKEY_CLASS: MAKEWORD(vk, hk_mods)
-    pub fn to_hotkey_ctrl_param(&self) -> usize {
-        let mut hk_mods = 0u8;
-        if self.modifiers & 0x0002 != 0 { hk_mods |= 0x02; } // MOD_CONTROL -> HOTKEYF_CONTROL
-        if self.modifiers & 0x0001 != 0 { hk_mods |= 0x04; } // MOD_ALT -> HOTKEYF_ALT
-        if self.modifiers & 0x0004 != 0 { hk_mods |= 0x01; } // MOD_SHIFT -> HOTKEYF_SHIFT
-        (self.vk as usize) | ((hk_mods as usize) << 8)
-    }
 }
 
 fn settings_path() -> PathBuf {

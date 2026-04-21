@@ -251,6 +251,13 @@ static ENTRIES: &[Entry] = &[
         zh: "保存", ja: "保存", ko: "저장",
     },
     Entry {
+        key: "settings.btn.browse",
+        en: "Browse...", ru: "Обзор...", es: "Examinar...", fr: "Parcourir...",
+        de: "Durchsuchen...", pt: "Procurar...", it: "Sfoglia...",
+        pl: "Przeglądaj...", tr: "Gözat...", uk: "Огляд...",
+        zh: "浏览...", ja: "参照...", ko: "찾아보기...",
+    },
+    Entry {
         key: "settings.btn.cancel",
         en: "Cancel", ru: "Отмена", es: "Cancelar", fr: "Annuler",
         de: "Abbrechen", pt: "Cancelar", it: "Annulla",

@@ -68,6 +68,27 @@ struct TranslationResult {
 }
 static PENDING_RESULT: Mutex<Option<TranslationResult>> = Mutex::new(None);
 
+struct HotkeyRegistration {
+    id: i32,
+    label: String,
+    config: settings::HotkeyConfig,
+    /// User-configured hotkeys are "required" — failures pop a visible error.
+    /// Hard-coded internal toggles (settings window, punto, taskbar centering)
+    /// are best-effort; if another app already owns the combo we just log it
+    /// and move on.  Those features are still reachable from the tray / UI.
+    required: bool,
+}
+
+struct StaComGuard;
+
+impl Drop for StaComGuard {
+    fn drop(&mut self) {
+        unsafe {
+            CoUninitialize();
+        }
+    }
+}
+
 fn get_settings() -> settings::Settings {
     CURRENT_SETTINGS.lock().unwrap().clone()
 }
@@ -102,13 +123,14 @@ fn main() {
 
     popup::init();
     tray::create();
-    register_hotkeys(&s);
+    let hotkey_failures = register_hotkeys(&s);
     if s.punto_enabled {
         autotype::start();
     }
     if s.taskbar_center_enabled {
         taskbar_center::start();
     }
+    show_hotkey_registration_failures(&hotkey_failures);
 
     run_main_loop();
     tray::destroy();
@@ -147,7 +169,7 @@ fn run_main_loop() {
                 println!("[*] Settings updated");
                 i18n::set_from_code(&new.language);
                 unregister_hotkeys();
-                register_hotkeys(&new);
+                let hotkey_failures = register_hotkeys(&new);
 
                 // Punto Switcher
                 if new.punto_enabled && !autotype::is_enabled() {
@@ -164,6 +186,7 @@ fn run_main_loop() {
                 }
 
                 *CURRENT_SETTINGS.lock().unwrap() = new;
+                show_hotkey_registration_failures(&hotkey_failures);
             }
         }
     }
@@ -187,23 +210,74 @@ fn dispatch_hotkey(id: i32) {
 // Hotkey registration
 // ============================================================
 
-fn register_hotkeys(s: &settings::Settings) {
+fn register_hotkeys(s: &settings::Settings) -> Vec<String> {
+    let registrations = vec![
+        HotkeyRegistration {
+            id: HOTKEY_TRANSLATE,
+            label: i18n::t("settings.hotkey.translate").to_string(),
+            config: s.hk_translate.clone(),
+            required: true,
+        },
+        HotkeyRegistration {
+            id: HOTKEY_OCR,
+            label: i18n::t("settings.hotkey.ocr").to_string(),
+            config: s.hk_ocr.clone(),
+            required: true,
+        },
+        HotkeyRegistration {
+            id: HOTKEY_SCREENSHOT,
+            label: i18n::t("settings.hotkey.screenshot").to_string(),
+            config: s.hk_screenshot.clone(),
+            required: true,
+        },
+        HotkeyRegistration {
+            id: HOTKEY_LAYOUT,
+            label: i18n::t("settings.hotkey.layout").to_string(),
+            config: s.hk_layout.clone(),
+            required: true,
+        },
+        HotkeyRegistration {
+            id: HOTKEY_EXPLORER_CMD,
+            label: i18n::t("settings.hotkey.explorer_cmd").to_string(),
+            config: s.hk_explorer_cmd.clone(),
+            required: true,
+        },
+        HotkeyRegistration {
+            id: HOTKEY_SETTINGS,
+            label: "Settings window".to_string(),
+            config: settings::HotkeyConfig { modifiers: 0x0003, vk: 0x4F },
+            required: false,
+        },
+        HotkeyRegistration {
+            id: HOTKEY_AUTOTYPE,
+            label: "Toggle auto layout correction".to_string(),
+            config: settings::HotkeyConfig { modifiers: 0x0003, vk: 0x41 },
+            required: false,
+        },
+        HotkeyRegistration {
+            id: HOTKEY_TASKBAR_CENTER,
+            label: "Toggle taskbar centering".to_string(),
+            config: settings::HotkeyConfig { modifiers: 0x0003, vk: 0x4D },
+            required: false,
+        },
+    ];
+
+    let mut failures = Vec::new();
     unsafe {
-        let reg = |id: i32, hk: &settings::HotkeyConfig| {
-            let _ = RegisterHotKey(None, id, HOT_KEY_MODIFIERS(hk.modifiers), hk.vk);
-        };
-        reg(HOTKEY_TRANSLATE, &s.hk_translate);
-        reg(HOTKEY_OCR, &s.hk_ocr);
-        reg(HOTKEY_SCREENSHOT, &s.hk_screenshot);
-        reg(HOTKEY_LAYOUT, &s.hk_layout);
-        reg(HOTKEY_EXPLORER_CMD, &s.hk_explorer_cmd);
-        // Settings: always Ctrl+Alt+O
-        let _ = RegisterHotKey(None, HOTKEY_SETTINGS, HOT_KEY_MODIFIERS(0x0003), 0x4F);
-        // Autotype toggle: always Ctrl+Alt+A
-        let _ = RegisterHotKey(None, HOTKEY_AUTOTYPE, HOT_KEY_MODIFIERS(0x0003), 0x41);
-        // Taskbar center toggle: always Ctrl+Alt+T
-        let _ = RegisterHotKey(None, HOTKEY_TASKBAR_CENTER, HOT_KEY_MODIFIERS(0x0003), 0x54);
+        for reg in registrations {
+            if RegisterHotKey(None, reg.id, HOT_KEY_MODIFIERS(reg.config.modifiers), reg.config.vk)
+                .is_err()
+            {
+                if reg.required {
+                    failures.push(format!("{} ({})", reg.label, reg.config.display()));
+                } else {
+                    println!("[!] Optional hotkey skipped: {} ({})",
+                        reg.label, reg.config.display());
+                }
+            }
+        }
     }
+    failures
 }
 
 fn unregister_hotkeys() {
@@ -212,6 +286,17 @@ fn unregister_hotkeys() {
             let _ = UnregisterHotKey(None, id);
         }
     }
+}
+
+fn show_hotkey_registration_failures(failures: &[String]) {
+    if failures.is_empty() {
+        return;
+    }
+
+    let details = failures.join("\n");
+    let message = format!("{}Hotkey unavailable:\n{details}", i18n::t("popup.error_prefix"));
+    println!("[!] {message}");
+    popup::show("", &message, "error");
 }
 
 // ============================================================
@@ -355,56 +440,77 @@ fn save_captured(pixels: &[u8], width: u32, height: u32) {
 }
 
 fn save_with_dialog(pixels: &[u8], width: u32, height: u32) -> anyhow::Result<Option<String>> {
-    use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL};
-    use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
-    use windows::Win32::UI::Shell::{FileSaveDialog, IFileSaveDialog, SIGDN_FILESYSPATH};
-    use windows::core::PCWSTR;
+    let screenshot_folder = {
+        let settings = get_settings();
+        if settings.screenshot_folder.is_empty() {
+            None
+        } else {
+            Some(settings.screenshot_folder)
+        }
+    };
 
-    let filter_name = utils::to_wide("PNG (*.png)");
-    let filter_ext = utils::to_wide("*.png");
+    let Some(path) = pick_png_save_path(screenshot_folder)? else {
+        return Ok(None);
+    };
 
-    unsafe {
-        let dialog: IFileSaveDialog =
-            CoCreateInstance(&FileSaveDialog, None, CLSCTX_ALL)
-                .map_err(|e| anyhow::anyhow!("Dialog: {e}"))?;
+    screenshot::save_png_to_file(pixels, width, height, &path)?;
+    Ok(Some(path))
+}
 
-        let filters = [COMDLG_FILTERSPEC {
-            pszName: PCWSTR(filter_name.as_ptr()),
-            pszSpec: PCWSTR(filter_ext.as_ptr()),
-        }];
-        let _ = dialog.SetFileTypes(&filters);
-        let _ = dialog.SetDefaultExtension(windows::core::w!("png"));
+fn pick_png_save_path(initial_folder: Option<String>) -> anyhow::Result<Option<String>> {
+    thread::spawn(move || -> anyhow::Result<Option<String>> {
+        use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, COINIT_APARTMENTTHREADED, CLSCTX_ALL};
+        use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+        use windows::Win32::UI::Shell::{FileSaveDialog, IFileSaveDialog, IShellItem, SHCreateItemFromParsingName, SIGDN_FILESYSPATH};
+        use windows::core::PCWSTR;
 
-        let now = chrono::Local::now();
-        let default_name = utils::to_wide(&now.format("screenshot_%Y%m%d_%H%M%S.png").to_string());
-        let _ = dialog.SetFileName(PCWSTR(default_name.as_ptr()));
+        unsafe {
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED)
+                .ok()
+                .map_err(|e| anyhow::anyhow!("CoInitializeEx: {e}"))?;
+            let _guard = StaComGuard;
 
-        // Open in the configured screenshot folder.
-        let s = get_settings();
-        if !s.screenshot_folder.is_empty() {
-            use windows::Win32::UI::Shell::{IShellItem, SHCreateItemFromParsingName};
-            let folder_wide = utils::to_wide(&s.screenshot_folder);
-            if let Ok(item) =
-                SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(folder_wide.as_ptr()), None)
-            {
-                let _ = dialog.SetFolder(&item);
+            let dialog: IFileSaveDialog =
+                CoCreateInstance(&FileSaveDialog, None, CLSCTX_ALL)
+                    .map_err(|e| anyhow::anyhow!("Dialog: {e}"))?;
+
+            let filter_name = utils::to_wide("PNG (*.png)");
+            let filter_ext = utils::to_wide("*.png");
+            let filters = [COMDLG_FILTERSPEC {
+                pszName: PCWSTR(filter_name.as_ptr()),
+                pszSpec: PCWSTR(filter_ext.as_ptr()),
+            }];
+            let _ = dialog.SetFileTypes(&filters);
+            let _ = dialog.SetDefaultExtension(windows::core::w!("png"));
+
+            let now = chrono::Local::now();
+            let default_name = utils::to_wide(&now.format("screenshot_%Y%m%d_%H%M%S.png").to_string());
+            let _ = dialog.SetFileName(PCWSTR(default_name.as_ptr()));
+
+            if let Some(folder) = initial_folder.as_ref() {
+                let folder_wide = utils::to_wide(folder);
+                if let Ok(item) =
+                    SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(folder_wide.as_ptr()), None)
+                {
+                    let _ = dialog.SetFolder(&item);
+                }
             }
+
+            if dialog.Show(None).is_err() {
+                return Ok(None);
+            }
+
+            let result = dialog.GetResult().map_err(|e| anyhow::anyhow!("GetResult: {e}"))?;
+            let path = result
+                .GetDisplayName(SIGDN_FILESYSPATH)
+                .map_err(|e| anyhow::anyhow!("GetPath: {e}"))?;
+            let path_str = path.to_string().unwrap_or_default();
+            CoTaskMemFree(Some(path.0 as *const _));
+            Ok(Some(path_str))
         }
-
-        if dialog.Show(None).is_err() {
-            return Ok(None);
-        }
-
-        let result = dialog.GetResult().map_err(|e| anyhow::anyhow!("GetResult: {e}"))?;
-        let path = result
-            .GetDisplayName(SIGDN_FILESYSPATH)
-            .map_err(|e| anyhow::anyhow!("GetPath: {e}"))?;
-        let path_str = path.to_string().unwrap_or_default();
-        CoTaskMemFree(Some(path.0 as *const _));
-
-        screenshot::save_png_to_file(pixels, width, height, &path_str)?;
-        Ok(Some(path_str))
-    }
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("Save dialog thread panicked"))?
 }
 
 fn handle_layout_switch() {
@@ -534,7 +640,11 @@ fn simulate_paste() {
 fn send_key_combo(modifier: VIRTUAL_KEY, key: VIRTUAL_KEY) {
     unsafe {
         // Release stale modifiers.
-        let release = [make_key_input(VK_MENU, true), make_key_input(VK_CONTROL, true)];
+        let release = [
+            make_key_input(VK_SHIFT, true),
+            make_key_input(VK_MENU, true),
+            make_key_input(VK_CONTROL, true),
+        ];
         let _ = SendInput(&release, size_of::<INPUT>() as i32);
         thread::sleep(Duration::from_millis(50));
 

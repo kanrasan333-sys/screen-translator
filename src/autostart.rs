@@ -51,7 +51,7 @@ pub fn set_enabled(enable: bool) {
 
         if enable {
             if let Ok(exe) = std::env::current_exe() {
-                let exe_str = exe.to_string_lossy().to_string();
+                let exe_str = format_run_command(&exe);
                 let exe_wide = to_wide(&exe_str);
                 let bytes = std::slice::from_raw_parts(
                     exe_wide.as_ptr() as *const u8,
@@ -70,5 +70,21 @@ pub fn set_enabled(enable: bool) {
         }
 
         let _ = RegCloseKey(hkey);
+    }
+}
+
+fn format_run_command(exe: &std::path::Path) -> String {
+    format!("\"{}\"", exe.to_string_lossy())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_run_command;
+    use std::path::Path;
+
+    #[test]
+    fn quotes_executable_path_for_run_key() {
+        let cmd = format_run_command(Path::new(r"C:\Program Files\Screen Translator\screen-translator.exe"));
+        assert_eq!(cmd, r#""C:\Program Files\Screen Translator\screen-translator.exe""#);
     }
 }

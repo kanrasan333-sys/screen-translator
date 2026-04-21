@@ -36,10 +36,12 @@ const CORNER_R: i32 = 12;
 
 const TIMER_FADEIN: usize = 100;
 const TIMER_SPINNER: usize = 101;
+const TIMER_AUTOHIDE: usize = 102;
 const TIMER_COPY_RESET: usize = 103;
 const FADE_STEP: u8 = 30;
 const FADE_INTERVAL_MS: u32 = 12;
 const SPINNER_INTERVAL_MS: u32 = 40;
+const AUTOHIDE_MS: u32 = 8000;
 const SPINNER_R: i32 = 10;
 const COPY_BTN_SIZE: i32 = 26;
 const MAX_POPUP_H: i32 = 500;
@@ -56,6 +58,13 @@ static CURRENT_ALPHA: Mutex<u8> = Mutex::new(0);
 static SPINNER_ANGLE: Mutex<i32> = Mutex::new(0);
 static COPY_HOVER: Mutex<bool> = Mutex::new(false);
 static COPY_DONE: Mutex<bool> = Mutex::new(false);
+
+/// Global low-level mouse hook installed while the popup is visible, so a
+/// click anywhere outside the popup dismisses it.  SetCapture is fragile
+/// here (cross-thread activation, SW_SHOWNOACTIVATE popups don't always
+/// get WM_CAPTURECHANGED in time) — a hook is guaranteed to see every
+/// click regardless of which window owns focus.
+static MOUSE_HOOK: Mutex<isize> = Mutex::new(0);
 
 struct PopupText {
     translated: String,
@@ -84,6 +93,12 @@ fn hfont(m: &Mutex<isize>) -> HFONT {
 
 fn is_loading() -> bool {
     POPUP_TEXT.lock().unwrap().as_ref().is_some_and(|t| t.loading)
+}
+
+fn should_show_on_create() -> bool {
+    POPUP_TEXT.lock().unwrap().as_ref().is_some_and(|t| {
+        t.loading || !t.translated.is_empty() || !t.original.is_empty()
+    })
 }
 
 // ============================================================
@@ -115,8 +130,8 @@ pub fn show_loading(msg: &str) {
     unsafe {
         if let Some(hwnd) = load_hwnd(&POPUP_RAW) {
             if IsWindow(hwnd).as_bool() {
+                kill_all_timers(hwnd);
                 set_alpha(hwnd, 245);
-                let _ = KillTimer(hwnd, TIMER_COPY_RESET);
                 reposition_and_repaint(hwnd);
                 let _ = SetTimer(hwnd, TIMER_SPINNER, SPINNER_INTERVAL_MS, None);
                 let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
@@ -147,13 +162,15 @@ pub fn show(original: &str, translated: &str, direction: &str) {
                 } else {
                     start_fadein(hwnd);
                 }
-                let _ = ShowWindow(hwnd, SW_SHOW);
-                let _ = SetForegroundWindow(hwnd);
+                let _ = SetTimer(hwnd, TIMER_AUTOHIDE, AUTOHIDE_MS, None);
+                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                install_mouse_hook();
                 return;
             }
         }
         if let Some(hwnd) = create_popup() {
             store_hwnd(&POPUP_RAW, hwnd);
+            install_mouse_hook();
         }
     }
 }
@@ -367,13 +384,15 @@ fn create_popup() -> Option<HWND> {
         SetWindowRgn(hwnd, rgn, true);
         reposition_and_repaint(hwnd);
 
-        if is_loading() {
+        if !should_show_on_create() {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        } else if is_loading() {
             set_alpha(hwnd, 245);
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         } else {
             start_fadein(hwnd);
-            let _ = ShowWindow(hwnd, SW_SHOW);
-            let _ = SetForegroundWindow(hwnd);
+            let _ = SetTimer(hwnd, TIMER_AUTOHIDE, AUTOHIDE_MS, None);
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
 
         Some(hwnd)
@@ -424,6 +443,7 @@ unsafe extern "system" fn popup_proc(
                         drop(angle);
                         let _ = InvalidateRect(hwnd, None, false);
                     }
+                    TIMER_AUTOHIDE => hide_popup(hwnd),
                     TIMER_COPY_RESET => {
                         let _ = KillTimer(hwnd, TIMER_COPY_RESET);
                         *COPY_DONE.lock().unwrap() = false;
@@ -468,18 +488,7 @@ unsafe extern "system" fn popup_proc(
                 LRESULT(0)
             }
             WM_ERASEBKGND => LRESULT(1),
-            WM_ACTIVATE => {
-                if (wp.0 & 0xFFFF) == 0 && !is_loading() {
-                    kill_all_timers(hwnd);
-                    let _ = ShowWindow(hwnd, SW_HIDE);
-                }
-                LRESULT(0)
-            }
-            WM_CLOSE => {
-                kill_all_timers(hwnd);
-                let _ = ShowWindow(hwnd, SW_HIDE);
-                LRESULT(0)
-            }
+            WM_CLOSE => { hide_popup(hwnd); LRESULT(0) }
             WM_DESTROY => {
                 kill_all_timers(hwnd);
                 *POPUP_RAW.lock().unwrap() = 0;
@@ -498,7 +507,75 @@ fn kill_all_timers(hwnd: HWND) {
     unsafe {
         let _ = KillTimer(hwnd, TIMER_FADEIN);
         let _ = KillTimer(hwnd, TIMER_SPINNER);
+        let _ = KillTimer(hwnd, TIMER_AUTOHIDE);
         let _ = KillTimer(hwnd, TIMER_COPY_RESET);
+    }
+}
+
+/// Centralised hide path.  Tears down the mouse hook so we stop
+/// receiving global click events while the popup isn't visible.
+unsafe fn hide_popup(hwnd: HWND) {
+    unsafe {
+        kill_all_timers(hwnd);
+        let _ = ShowWindow(hwnd, SW_HIDE);
+        uninstall_mouse_hook();
+    }
+}
+
+// ============================================================
+// Low-level mouse hook — "click outside to dismiss"
+// ============================================================
+
+unsafe extern "system" fn mouse_hook_proc(
+    code: i32, wp: WPARAM, lp: LPARAM,
+) -> LRESULT {
+    unsafe {
+        if code >= 0 {
+            let msg = wp.0 as u32;
+            if msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN {
+                let info = &*(lp.0 as *const MSLLHOOKSTRUCT);
+                if let Some(hwnd) = load_hwnd(&POPUP_RAW) {
+                    if IsWindowVisible(hwnd).as_bool() {
+                        let mut rc = RECT::default();
+                        let _ = GetWindowRect(hwnd, &mut rc);
+                        let (px, py) = (info.pt.x, info.pt.y);
+                        let inside = px >= rc.left && px < rc.right
+                                  && py >= rc.top  && py < rc.bottom;
+                        if !inside {
+                            // Don't call hide_popup from the hook thread —
+                            // post back to the popup's thread and let the
+                            // window proc handle teardown cleanly.  The click
+                            // itself continues to whatever app it targeted
+                            // (CallNextHookEx below).
+                            let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+                        }
+                    }
+                }
+            }
+        }
+        CallNextHookEx(HHOOK::default(), code, wp, lp)
+    }
+}
+
+unsafe fn install_mouse_hook() {
+    unsafe {
+        let mut g = MOUSE_HOOK.lock().unwrap();
+        if *g != 0 { return; }
+        let Ok(hmodule) = GetModuleHandleW(None) else { return };
+        let hook = SetWindowsHookExW(
+            WH_MOUSE_LL, Some(mouse_hook_proc),
+            HINSTANCE(hmodule.0), 0,
+        ).unwrap_or_default();
+        *g = hook.0 as isize;
+    }
+}
+
+unsafe fn uninstall_mouse_hook() {
+    unsafe {
+        let mut g = MOUSE_HOOK.lock().unwrap();
+        if *g == 0 { return; }
+        let _ = UnhookWindowsHookEx(HHOOK(*g as *mut _));
+        *g = 0;
     }
 }
 

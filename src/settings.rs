@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct HotkeyConfig {
@@ -24,6 +25,10 @@ pub struct Settings {
     /// ISO 639-1 language code for the UI ("en", "ru", "es", ...).
     #[serde(default = "default_lang")]
     pub language: String,
+    /// DeepSeek API key. If non-empty, DeepSeek is used for translation
+    /// instead of the free MyMemory API.
+    #[serde(default = "String::new")]
+    pub deepseek_api_key: String,
 }
 
 fn yes() -> bool { true }
@@ -44,6 +49,7 @@ impl Settings {
         punto_enabled: true,
         taskbar_center_enabled: true,
         language: String::new(), // filled with "en" on load if missing
+        deepseek_api_key: String::new(),
     };
 }
 
@@ -117,6 +123,20 @@ pub fn load() -> Settings {
             s
         }
     }
+}
+
+// ============================================================
+// Shared current-settings snapshot (read by translate, UI, etc.)
+// ============================================================
+
+pub static CURRENT: Mutex<Settings> = Mutex::new(Settings::DEFAULT);
+
+pub fn current() -> Settings {
+    CURRENT.lock().unwrap().clone()
+}
+
+pub fn set_current(s: Settings) {
+    *CURRENT.lock().unwrap() = s;
 }
 
 pub fn save(settings: &Settings) {

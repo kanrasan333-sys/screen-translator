@@ -57,7 +57,6 @@ const ALL_HOTKEY_IDS: [i32; 8] = [
 // ============================================================
 
 static MAIN_THREAD_ID: AtomicU32 = AtomicU32::new(0);
-static CURRENT_SETTINGS: Mutex<settings::Settings> = Mutex::new(settings::Settings::DEFAULT);
 
 /// Result delivered from a background translation thread.
 struct TranslationResult {
@@ -90,7 +89,7 @@ impl Drop for StaComGuard {
 }
 
 fn get_settings() -> settings::Settings {
-    CURRENT_SETTINGS.lock().unwrap().clone()
+    settings::current()
 }
 
 /// Wakes the main thread so `MsgWaitForMultipleObjectsEx` returns
@@ -119,7 +118,7 @@ fn main() {
 
     let s = settings::load();
     i18n::set_from_code(&s.language);
-    *CURRENT_SETTINGS.lock().unwrap() = s.clone();
+    settings::set_current(s.clone());
 
     popup::init();
     tray::create();
@@ -185,7 +184,7 @@ fn run_main_loop() {
                     taskbar_center::stop();
                 }
 
-                *CURRENT_SETTINGS.lock().unwrap() = new;
+                settings::set_current(new);
                 show_hotkey_registration_failures(&hotkey_failures);
             }
         }

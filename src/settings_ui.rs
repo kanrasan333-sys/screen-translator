@@ -62,12 +62,14 @@ const IDC_CHK_TASKBAR:     i32 = 111;
 const IDC_CHK_AUTOSTART:   i32 = 112;
 const IDC_COMBO_LANG:      i32 = 114;
 const IDC_CHK_EXPLORER_CMD: i32 = 115;
+const IDC_EDIT_DEEPSEEK:   i32 = 116;
 
 // Section headers (`WM_CTLCOLORSTATIC` gives these the accent colour).
 const IDC_SEC_GENERAL: i32 = 200;
 const IDC_SEC_HOTKEYS: i32 = 201;
 const IDC_SEC_FOLDER:  i32 = 202;
 const IDC_SEC_FUNC:    i32 = 203;
+const IDC_SEC_TRANS:   i32 = 204;
 
 // Private window message: the worker thread running the folder-picker
 // posts the chosen path back to the settings window via this message.
@@ -109,16 +111,22 @@ mod layout {
     pub const Y_LANG:       i32 = Y_SEC_GEN + SEC_HEADER_H + SEC_PAD_TOP;
 
     pub const Y_SEP1:       i32 = Y_LANG + INPUT_H + SEC_PAD_BOT;
-    pub const Y_SEC_HK:     i32 = Y_SEP1 + 12;
+    pub const Y_SEC_TRANS:  i32 = Y_SEP1 + 12;
+    pub const Y_DEEPSEEK:   i32 = Y_SEC_TRANS + SEC_HEADER_H + SEC_PAD_TOP;
+    pub const HINT_H:       i32 = 18;
+    pub const Y_DEEPSEEK_HINT: i32 = Y_DEEPSEEK + INPUT_H + 6;
+
+    pub const Y_SEP2:       i32 = Y_DEEPSEEK_HINT + HINT_H + SEC_PAD_BOT;
+    pub const Y_SEC_HK:     i32 = Y_SEP2 + 12;
     pub const Y_HK_START:   i32 = Y_SEC_HK + SEC_HEADER_H + SEC_PAD_TOP;
     pub const Y_HK_END:     i32 = Y_HK_START + HK_STEP * 5;
 
-    pub const Y_SEP2:       i32 = Y_HK_END + SEC_PAD_BOT;
-    pub const Y_SEC_FOLDER: i32 = Y_SEP2 + 12;
+    pub const Y_SEP3:       i32 = Y_HK_END + SEC_PAD_BOT;
+    pub const Y_SEC_FOLDER: i32 = Y_SEP3 + 12;
     pub const Y_FOLDER:     i32 = Y_SEC_FOLDER + SEC_HEADER_H + SEC_PAD_TOP;
 
-    pub const Y_SEP3:       i32 = Y_FOLDER + INPUT_H + SEC_PAD_BOT;
-    pub const Y_SEC_FUNC:   i32 = Y_SEP3 + 12;
+    pub const Y_SEP4:       i32 = Y_FOLDER + INPUT_H + SEC_PAD_BOT;
+    pub const Y_SEC_FUNC:   i32 = Y_SEP4 + 12;
     pub const Y_CHK_START:  i32 = Y_SEC_FUNC + SEC_HEADER_H + SEC_PAD_TOP;
     pub const Y_CHK_END:    i32 = Y_CHK_START + CHK_STEP * 4;
 
@@ -295,6 +303,19 @@ unsafe fn create_controls(parent: HWND, hinst: HINSTANCE, s: &Settings) {
             i18n::t("settings.label.language"), 0);
         create_lang_combo(parent, hinst, r.font_body(),
             INPUT_X, Y_LANG, INPUT_W, &s.language);
+
+        // ── TRANSLATION section ──
+        section_header(parent, hinst, r, MARGIN, Y_SEC_TRANS,
+            i18n::t("settings.section.translation"), IDC_SEC_TRANS);
+        create_label(parent, hinst, r.font_body(),
+            MARGIN, Y_DEEPSEEK + 5, LABEL_W, 20,
+            i18n::t("settings.label.deepseek_key"), 0);
+        create_edit_field(parent, hinst, r.font_body(),
+            INPUT_X, Y_DEEPSEEK, INPUT_W, INPUT_H,
+            &s.deepseek_api_key, IDC_EDIT_DEEPSEEK);
+        create_label(parent, hinst, r.font_meta(),
+            MARGIN, Y_DEEPSEEK_HINT, WIN_W - MARGIN * 2, HINT_H,
+            i18n::t("settings.hint.deepseek"), 0);
 
         // ── HOTKEYS ──
         section_header(parent, hinst, r, MARGIN, Y_SEC_HK,
@@ -498,8 +519,16 @@ unsafe fn read_hotkey(parent: HWND, id: i32) -> HotkeyConfig {
 }
 
 unsafe fn read_folder(parent: HWND) -> String {
+    unsafe { read_edit_text(parent, IDC_EDIT_FOLDER) }
+}
+
+unsafe fn read_deepseek_key(parent: HWND) -> String {
+    unsafe { read_edit_text(parent, IDC_EDIT_DEEPSEEK) }
+}
+
+unsafe fn read_edit_text(parent: HWND, id: i32) -> String {
     unsafe {
-        let ctrl = GetDlgItem(parent, IDC_EDIT_FOLDER).unwrap_or_default();
+        let ctrl = GetDlgItem(parent, id).unwrap_or_default();
         let len = GetWindowTextLengthW(ctrl) as usize;
         if len == 0 { return String::new(); }
         let mut buf = vec![0u16; len + 2];
@@ -898,10 +927,16 @@ unsafe fn paint_hero(hdc: HDC) {
 /// native EDIT for the folder path is listed here.
 fn input_rects() -> Vec<(i32, RECT)> {
     use layout::*;
-    vec![(IDC_EDIT_FOLDER, RECT {
-        left: MARGIN, top: Y_FOLDER,
-        right: MARGIN + FOLDER_W, bottom: Y_FOLDER + INPUT_H,
-    })]
+    vec![
+        (IDC_EDIT_FOLDER, RECT {
+            left: MARGIN, top: Y_FOLDER,
+            right: MARGIN + FOLDER_W, bottom: Y_FOLDER + INPUT_H,
+        }),
+        (IDC_EDIT_DEEPSEEK, RECT {
+            left: INPUT_X, top: Y_DEEPSEEK,
+            right: INPUT_X + INPUT_W, bottom: Y_DEEPSEEK + INPUT_H,
+        }),
+    ]
 }
 
 unsafe fn paint(hwnd: HWND) {
@@ -916,7 +951,7 @@ unsafe fn paint(hwnd: HWND) {
         // ── Section separators ──
         let sep_pen = CreatePen(PS_SOLID, 1, COLORREF(theme::CLR_SEPARATOR));
         let old_sep = SelectObject(hdc, sep_pen);
-        for y in [Y_SEP1, Y_SEP2, Y_SEP3] {
+        for y in [Y_SEP1, Y_SEP2, Y_SEP3, Y_SEP4] {
             let _ = MoveToEx(hdc, MARGIN, y, None);
             let _ = LineTo(hdc, WIN_W - MARGIN, y);
         }
@@ -925,7 +960,7 @@ unsafe fn paint(hwnd: HWND) {
 
         let accent_pen = CreatePen(PS_SOLID, 2, COLORREF(theme::CLR_ACCENT));
         let old_accent = SelectObject(hdc, accent_pen);
-        for y in [Y_SEP1, Y_SEP2, Y_SEP3] {
+        for y in [Y_SEP1, Y_SEP2, Y_SEP3, Y_SEP4] {
             let _ = MoveToEx(hdc, MARGIN, y, None);
             let _ = LineTo(hdc, MARGIN + 54, y);
         }
@@ -997,6 +1032,7 @@ unsafe fn do_save(hwnd: HWND) {
             punto_enabled: read_checkbox(hwnd, IDC_CHK_PUNTO),
             taskbar_center_enabled: read_checkbox(hwnd, IDC_CHK_TASKBAR),
             language: read_selected_language(hwnd),
+            deepseek_api_key: read_deepseek_key(hwnd).trim().to_string(),
         };
 
         // Side-channel toggles (registry / context menu).
@@ -1033,7 +1069,7 @@ unsafe extern "system" fn settings_proc(
                 SetBkMode(hdc, TRANSPARENT);
                 let ctrl = HWND(lp.0 as *mut _);
                 let ctrl_id = GetDlgCtrlID(ctrl);
-                let text_clr = if (IDC_SEC_GENERAL..=IDC_SEC_FUNC).contains(&ctrl_id) {
+                let text_clr = if (IDC_SEC_GENERAL..=IDC_SEC_TRANS).contains(&ctrl_id) {
                     theme::CLR_ACCENT
                 } else {
                     theme::CLR_TEXT

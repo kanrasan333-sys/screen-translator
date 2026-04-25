@@ -134,6 +134,7 @@ pub fn show_loading(msg: &str) {
                 set_alpha(hwnd, 245);
                 reposition_and_repaint(hwnd);
                 let _ = SetTimer(hwnd, TIMER_SPINNER, SPINNER_INTERVAL_MS, None);
+                raise_topmost(hwnd);
                 let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                 return;
             }
@@ -163,6 +164,7 @@ pub fn show(original: &str, translated: &str, direction: &str) {
                     start_fadein(hwnd);
                 }
                 let _ = SetTimer(hwnd, TIMER_AUTOHIDE, AUTOHIDE_MS, None);
+                raise_topmost(hwnd);
                 let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                 install_mouse_hook();
                 return;
@@ -192,6 +194,18 @@ unsafe fn set_alpha(hwnd: HWND, alpha: u8) {
     unsafe {
         *CURRENT_ALPHA.lock().unwrap() = alpha;
         let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA);
+    }
+}
+
+/// Re-asserts HWND_TOPMOST so we stay above any other topmost window
+/// that became active after us (e.g. IME candidate windows, other
+/// utilities, OSD overlays).
+unsafe fn raise_topmost(hwnd: HWND) {
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
     }
 }
 
@@ -388,10 +402,12 @@ fn create_popup() -> Option<HWND> {
             let _ = ShowWindow(hwnd, SW_HIDE);
         } else if is_loading() {
             set_alpha(hwnd, 245);
+            raise_topmost(hwnd);
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         } else {
             start_fadein(hwnd);
             let _ = SetTimer(hwnd, TIMER_AUTOHIDE, AUTOHIDE_MS, None);
+            raise_topmost(hwnd);
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
 

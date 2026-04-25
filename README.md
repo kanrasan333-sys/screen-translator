@@ -13,7 +13,7 @@ Lives in the system tray and exposes everything through global hotkeys.
 | Replaces | With this feature |
 | --- | --- |
 | **Lightshot** | Region screenshot to clipboard (`Ctrl+Alt+D`) |
-| **QTranslate** / Google Translate popup | Clipboard translation with popup (`Ctrl+Alt+T`) and region OCR + translation (`Ctrl+Alt+S`) |
+| **QTranslate** / Google Translate popup | Clipboard translation with popup (`Ctrl+Alt+T`) and region OCR + translation (`Ctrl+Alt+S`); auto-detects 18+ source languages, optional DeepSeek backend |
 | **Punto Switcher** | Manual and automatic keyboard-layout correction for the last typed word (`привет` ⇄ `ghbdtn`) |
 | **TaskbarX** / TaskbarCenter | Dynamically keeps taskbar icons centered |
 
@@ -24,9 +24,17 @@ system tray with a ~20 MB memory footprint.
 
 ## Features
 
-- **Clipboard translation** — copies the current selection, translates it
-  via [MyMemory](https://mymemory.translated.net/) (no API key required),
-  and shows a popup next to the cursor. RU ↔ EN direction is auto-detected.
+- **Clipboard translation** — copies the current selection, translates it,
+  and shows a popup next to the cursor. The source language is auto-detected
+  from the text (Cyrillic → ru/uk, kana → ja, hangul → ko, Han → zh,
+  Arabic / Hebrew / Greek / Thai / Devanagari, plus Latin variants
+  de/es/fr/it/pt/pl/tr by distinctive characters); the target is the
+  currently selected UI language.
+- **Two translation backends** — by default uses the free
+  [MyMemory](https://mymemory.translated.net/) API (no key required);
+  if a DeepSeek API key is set in settings, the much higher-quality
+  `deepseek-chat` model is used instead, with automatic fallback to
+  MyMemory on any error.
 - **Region OCR + translation** — draw a rectangle with the mouse, the
   captured pixels are recognized via [OCR.space](https://ocr.space/) (primary
   engine) with a fallback to the built-in Windows WinRT OCR, then translated.
@@ -39,6 +47,8 @@ system tray with a ~20 MB memory footprint.
   of the taskbar and keeps them centered as icons come and go.
 - **System tray** — left-click opens settings, right-click shows a
   "Settings / Exit" menu. The console window is hidden.
+- **Multi-language UI** — settings, popup, and tray menu translated into
+  13 languages (en, ru, es, fr, de, pt, it, pl, tr, uk, zh, ja, ko).
 - **Windows autostart** — optional one-click toggle that writes to
   `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
 
@@ -118,7 +128,9 @@ packs to be installed in Windows).
 - [`anyhow`](https://crates.io/crates/anyhow) — error handling
 
 External services used:
-- MyMemory Translation API (free, no key required)
+- MyMemory Translation API (free, no key required) — default translator
+- DeepSeek Chat Completions API (paid, optional) — higher-quality
+  alternative; configure the key in the settings window
 - OCR.space Parse Image API (free, optional key)
 
 ---
@@ -138,8 +150,9 @@ src/
 ├── capture.rs         # rectangular screen-region selector overlay
 ├── screenshot.rs      # pixel capture and PNG encoding
 ├── ocr.rs             # OCR.space + WinRT OCR
-├── translate.rs       # MyMemory translation client
+├── translate.rs       # DeepSeek + MyMemory translation, language detection
 ├── popup.rs           # translation result popup window
+├── i18n.rs            # 13-language UI string table
 ├── theme.rs           # dark theme color palette
 └── utils.rs           # UTF-16, urlencode, Win32 input helpers
 ```

@@ -664,7 +664,7 @@ fn handle_ask() {
     // answer that isn't coming is exactly the case where the window is asked
     // for with no selection at all: the common one.
     let before = unsafe { GetClipboardSequenceNumber() };
-    simulate_copy();
+    send_key_combo_after(VK_CONTROL, VK_C, COPY_SETTLE_HOTKEY);
     let selection = await_copy(before, Instant::now() + SELECTION_BLOCKING_WAIT);
 
     let had_selection = selection.is_some();
@@ -684,8 +684,22 @@ fn handle_ask() {
 
 /// How long the hotkey is willing to hold the window back waiting for a copy,
 /// and how long a straggler is still worth accepting once it is up.
-const SELECTION_BLOCKING_WAIT: Duration = Duration::from_millis(120);
+///
+/// The blocking half only has to cover the common case — an application that
+/// answers `Ctrl+C` immediately — because anything slower is caught by the late
+/// pass and dropped into the input a moment after the window is already up.
+/// That is what lets it be this short.
+const SELECTION_BLOCKING_WAIT: Duration = Duration::from_millis(40);
 const SELECTION_LATE_WAIT: Duration = Duration::from_millis(600);
+
+/// Pause between releasing stale modifiers and sending the combination.
+///
+/// The hotkey path uses a short one: it is spent on every summon, including the
+/// far more common one where nothing is selected at all. Fifty milliseconds is
+/// the conservative figure the translate and layout hotkeys keep, where it is
+/// paid once per deliberate action rather than on every window open.
+const COPY_SETTLE_HOTKEY: Duration = Duration::from_millis(15);
+const COPY_SETTLE_DEFAULT: Duration = Duration::from_millis(50);
 
 /// Watches the clipboard for the result of a `Ctrl+C` we just sent, giving up
 /// at `deadline`.
@@ -813,6 +827,12 @@ fn simulate_paste() {
 
 /// Releases all modifiers, then sends `modifier + key`.
 fn send_key_combo(modifier: VIRTUAL_KEY, key: VIRTUAL_KEY) {
+    send_key_combo_after(modifier, key, COPY_SETTLE_DEFAULT);
+}
+
+/// As above, but with the settle spelled out — the hotkey path wants a shorter
+/// one than the deliberate translate and layout actions do.
+fn send_key_combo_after(modifier: VIRTUAL_KEY, key: VIRTUAL_KEY, settle: Duration) {
     unsafe {
         // Release stale modifiers.
         let release = [
@@ -821,7 +841,7 @@ fn send_key_combo(modifier: VIRTUAL_KEY, key: VIRTUAL_KEY) {
             make_key_input(VK_CONTROL, true),
         ];
         let _ = SendInput(&release, size_of::<INPUT>() as i32);
-        thread::sleep(Duration::from_millis(50));
+        thread::sleep(settle);
 
         let combo = [
             make_key_input(modifier, false),

@@ -61,6 +61,18 @@ const WM_APP_REPLY: u32 = WM_APP + 11;
 /// Posted when a copied selection turns up after the window was already shown.
 const WM_APP_PREFILL: u32 = WM_APP + 12;
 
+/// Drives the unfold.  `WM_TIMER` is floored by the system timer resolution —
+/// asking for 8 ms measures out at about 15, so this runs near 60 fps whatever
+/// is requested.  Raising the global timer resolution to close that gap costs
+/// every other process on the machine battery for a 200 ms movement.
+const ANIM_TIMER: usize = 1;
+const ANIM_TICK_MS: u32 = 8;
+
+/// Share of the remaining distance covered each tick.  Exponential ease-out:
+/// the panel leaves quickly and settles, which reads as movement rather than
+/// as a window being resized.
+const ANIM_EASE: f32 = 0.34;
+
 // ============================================================
 // Layout
 // ============================================================
@@ -144,6 +156,9 @@ static BUSY: Mutex<bool> = Mutex::new(false);
 
 /// A selection that finished copying only after the window was up.
 static PENDING_PREFILL: Mutex<Option<String>> = Mutex::new(None);
+
+/// Height the window is currently travelling towards, while the unfold runs.
+static ANIM_TARGET: Mutex<i32> = Mutex::new(0);
 
 static ASK_HWND: Mutex<isize> = Mutex::new(0);
 
@@ -741,6 +756,22 @@ unsafe fn fit_to_content(hwnd: HWND) {
             return;
         }
 
+        // Before it is on screen there is nothing to animate — and the
+        // no-key notice takes this path, which should simply be the size it
+        // opens at.
+        if !IsWindowVisible(hwnd).as_bool() {
+            set_height(hwnd, height);
+            return;
+        }
+
+        *ANIM_TARGET.lock().unwrap() = height;
+        SetTimer(hwnd, ANIM_TIMER, ANIM_TICK_MS, None);
+    }
+}
+
+/// Puts the window at `height` immediately, region and all.
+unsafe fn set_height(hwnd: HWND, height: i32) {
+    unsafe {
         let _ = SetWindowPos(
             hwnd,
             None,
@@ -752,6 +783,35 @@ unsafe fn fit_to_content(hwnd: HWND) {
         );
         round_corners(hwnd, height);
         let _ = InvalidateRect(hwnd, None, true);
+    }
+}
+
+/// One frame of the unfold: cover a share of what is left, and stop once the
+/// remainder is smaller than a pixel of travel.
+unsafe fn step_unfold(hwnd: HWND) {
+    unsafe {
+        let target = *ANIM_TARGET.lock().unwrap();
+        let mut cur = RECT::default();
+        let _ = GetWindowRect(hwnd, &mut cur);
+        let now = cur.bottom - cur.top;
+
+        let remaining = target - now;
+        if remaining == 0 {
+            let _ = KillTimer(hwnd, ANIM_TIMER);
+            return;
+        }
+
+        // At least a pixel, so a slow tail still converges.
+        let step = ((remaining as f32 * ANIM_EASE) as i32).clamp(-remaining.abs(), remaining.abs());
+        let step = if step == 0 { remaining.signum() } else { step };
+        let next = now + step;
+
+        if (target - next).abs() <= 1 {
+            let _ = KillTimer(hwnd, ANIM_TIMER);
+            set_height(hwnd, target);
+        } else {
+            set_height(hwnd, next);
+        }
     }
 }
 
@@ -802,6 +862,11 @@ unsafe extern "system" fn ask_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 LRESULT(0)
             }
 
+            WM_TIMER if wp.0 == ANIM_TIMER => {
+                step_unfold(hwnd);
+                LRESULT(0)
+            }
+
             m if m == WM_APP_REPLY => {
                 take_reply(hwnd);
                 LRESULT(0)
@@ -838,6 +903,7 @@ unsafe extern "system" fn ask_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             }
 
             WM_DESTROY => {
+                let _ = KillTimer(hwnd, ANIM_TIMER);
                 *DISMISS_ON_BLUR.lock().unwrap() = false;
                 *ASK_HWND.lock().unwrap() = 0;
                 LRESULT(0)

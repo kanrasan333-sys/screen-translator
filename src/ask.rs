@@ -22,7 +22,7 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{SetWindowTheme, ShowScrollBar};
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, SetFocus, VK_SHIFT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, SetFocus, VK_CONTROL, VK_SHIFT};
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
@@ -41,6 +41,11 @@ const EM_SETSEL: u32 = 0x00B1;
 const EM_SCROLLCARET: u32 = 0x00B7;
 const EM_GETLINECOUNT: u32 = 0x00BA;
 
+/// `VK_A`, `VK_CONTROL` — the windows crate exposes these, but only the two
+/// are needed here and importing them by name reads worse than the codes do
+/// alongside the `0x0D` / `0x1B` already used below.
+const VK_A: usize = 0x41;
+
 /// A popup class asks for the system's drop shadow with this style.
 const CS_DROPSHADOW: WNDCLASS_STYLES = WNDCLASS_STYLES(0x0002_0000);
 
@@ -52,6 +57,9 @@ const IDC_QUESTION: i32 = 402;
 
 /// Posted by the worker thread once a reply (or an error) is waiting.
 const WM_APP_REPLY: u32 = WM_APP + 11;
+
+/// Posted when a copied selection turns up after the window was already shown.
+const WM_APP_PREFILL: u32 = WM_APP + 12;
 
 // ============================================================
 // Layout
@@ -79,6 +87,13 @@ mod layout {
     pub const BOTTOM: i32 = 14;
 
     pub const CORNER: i32 = 12;
+
+    /// Where the collapsed box sits vertically, as a fraction of the work
+    /// area.  A third of the way down rather than halfway: dead centre reads
+    /// as low once the answer unfolds beneath it, and it is where every
+    /// summoned launcher has sat since Spotlight.
+    pub const ANCHOR_NUM: i32 = 1;
+    pub const ANCHOR_DEN: i32 = 3;
 
     /// Total window height for an answer pane `answer_h` tall.
     pub const fn expanded(answer_h: i32) -> i32 {
@@ -127,7 +142,14 @@ static PENDING: Mutex<Option<Result<String, String>>> = Mutex::new(None);
 /// Set while a request is in flight, so a second Enter doesn't stack calls.
 static BUSY: Mutex<bool> = Mutex::new(false);
 
+/// A selection that finished copying only after the window was up.
+static PENDING_PREFILL: Mutex<Option<String>> = Mutex::new(None);
+
 static ASK_HWND: Mutex<isize> = Mutex::new(0);
+
+/// Whether losing focus should dismiss the window.  Off until it is fully up,
+/// so the activation churn of showing it doesn't close it immediately.
+static DISMISS_ON_BLUR: Mutex<bool> = Mutex::new(false);
 
 struct Resources {
     panel_brush: isize,
@@ -209,17 +231,52 @@ fn res() -> std::sync::MutexGuard<'static, Option<Box<Resources>>> {
 // Public API
 // ============================================================
 
-/// Opens the window, or brings it forward if it is already up.
-pub fn open() {
+/// The live window, if there is one.
+fn live() -> Option<HWND> {
+    let v = *ASK_HWND.lock().unwrap();
+    if v == 0 {
+        return None;
+    }
+    let hwnd = HWND(v as *mut _);
+    unsafe { IsWindow(hwnd).as_bool() }.then_some(hwnd)
+}
+
+pub fn is_open() -> bool {
+    live().is_some()
+}
+
+pub fn close() {
+    if let Some(hwnd) = live() {
+        unsafe {
+            let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
+/// Hands the window a selection that finished copying after it was shown.
+///
+/// Dropped unless the input is still untouched — the point is to catch a slow
+/// application, never to overwrite something the user has started typing.
+pub fn prefill_late(text: String) {
+    if text.trim().is_empty() {
+        return;
+    }
+    let Some(hwnd) = live() else {
+        return;
+    };
+    *PENDING_PREFILL.lock().unwrap() = Some(text);
     unsafe {
-        let v = *ASK_HWND.lock().unwrap();
-        if v != 0 {
-            let hwnd = HWND(v as *mut _);
-            if IsWindow(hwnd).as_bool() {
-                let _ = SetForegroundWindow(hwnd);
-                focus_input(hwnd);
-                return;
-            }
+        let _ = PostMessageW(hwnd, WM_APP_PREFILL, WPARAM(0), LPARAM(0));
+    }
+}
+
+/// Opens the window with `prefill` already in the input, unsent.
+pub fn open(prefill: &str) {
+    unsafe {
+        if let Some(hwnd) = live() {
+            let _ = SetForegroundWindow(hwnd);
+            focus_input(hwnd);
+            return;
         }
 
         {
@@ -230,7 +287,9 @@ pub fn open() {
         }
         HISTORY.lock().unwrap().clear();
         *PENDING.lock().unwrap() = None;
+        *PENDING_PREFILL.lock().unwrap() = None;
         *BUSY.lock().unwrap() = false;
+        *DISMISS_ON_BLUR.lock().unwrap() = false;
 
         let Some(hmodule) = GetModuleHandleW(None).ok() else {
             return;
@@ -249,10 +308,12 @@ pub fn open() {
         };
         RegisterClassW(&wc);
 
-        // Centred on the primary screen.  The top edge stays put when an
-        // answer arrives, so the input never jumps out from under the cursor.
-        let sw = GetSystemMetrics(SM_CXSCREEN);
-        let sh = GetSystemMetrics(SM_CYSCREEN);
+        // Horizontally centred on the work area, vertically a third of the
+        // way down it.  The taskbar is not space the window can use, so the
+        // work area is what both are measured against.  The top edge then
+        // stays put when an answer arrives, so the input never jumps out from
+        // under the cursor.
+        let (x, y) = anchored_origin(layout::WIN_W, layout::HEAD_H);
         let title = to_wide(i18n::t("ask.title"));
 
         let hwnd = CreateWindowExW(
@@ -260,8 +321,8 @@ pub fn open() {
             class,
             PCWSTR(title.as_ptr()),
             WS_POPUP | WS_CLIPCHILDREN,
-            (sw - layout::WIN_W) / 2,
-            (sh - layout::HEAD_H) / 2,
+            x,
+            y,
             layout::WIN_W,
             layout::HEAD_H,
             HWND::default(),
@@ -286,9 +347,41 @@ pub fn open() {
             fit_to_content(hwnd);
         }
 
+        put_question(hwnd, prefill.trim());
+
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
         focus_input(hwnd);
+        // Only now: `SetForegroundWindow` can bounce activation around while
+        // the window is coming up, and a WM_ACTIVATE in the middle of that
+        // would close it before it was ever seen.
+        *DISMISS_ON_BLUR.lock().unwrap() = true;
+    }
+}
+
+/// Top-left corner placing a `width` x `height` window horizontally centred and
+/// vertically a third of the way down the work area of the monitor the pointer
+/// is on.
+unsafe fn anchored_origin(width: i32, height: i32) -> (i32, i32) {
+    unsafe {
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY);
+
+        let mut mi = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetMonitorInfoW(mon, &mut mi).as_bool() {
+            let wa = mi.rcWork;
+            (
+                wa.left + (wa.right - wa.left - width) / 2,
+                anchor_y(wa.top, wa.bottom - wa.top, height),
+            )
+        } else {
+            let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+            ((sw - width) / 2, anchor_y(0, sh, height))
+        }
     }
 }
 
@@ -386,9 +479,26 @@ unsafe extern "system" fn field_proc(
 ) -> LRESULT {
     unsafe {
         let is_input = GetDlgCtrlID(hwnd) == IDC_QUESTION;
-        let shift = || GetAsyncKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000 != 0;
+        // `GetKeyState`, not `GetAsyncKeyState`: inside a window procedure the
+        // state that matters is the one that went with the message being
+        // handled, not whatever the keyboard happens to be doing now.
+        let down = |vk: i32| GetKeyState(vk) as u16 & 0x8000 != 0;
+        let shift = || down(VK_SHIFT.0 as i32);
+        let ctrl = || down(VK_CONTROL.0 as i32);
 
         match msg {
+            // The stock EDIT control has never implemented Ctrl+A; it comes
+            // from the dialog manager, which a bare `WS_POPUP` window doesn't
+            // have.  Applies to the answer pane too, where select-all is what
+            // makes Ctrl+C useful.
+            WM_KEYDOWN if wp.0 == VK_A && ctrl() => {
+                let _ = SendMessageW(hwnd, EM_SETSEL, WPARAM(0), LPARAM(-1));
+                LRESULT(0)
+            }
+            // Ctrl+A also arrives as WM_CHAR 0x01, which the control would
+            // answer with a beep.
+            WM_CHAR if wp.0 == 0x01 => LRESULT(0),
+
             WM_KEYDOWN if wp.0 == 0x1B => {
                 // VK_ESCAPE — close from whichever field has focus.
                 if let Ok(parent) = GetParent(hwnd) {
@@ -663,6 +773,13 @@ unsafe fn round_corners(hwnd: HWND, height: i32) {
     }
 }
 
+/// Vertical origin that centres a `height`-tall box on the anchor line, kept
+/// on screen if the area is too short for it.
+fn anchor_y(top: i32, area_h: i32, height: i32) -> i32 {
+    let centre = top + area_h * layout::ANCHOR_NUM / layout::ANCHOR_DEN;
+    (centre - height / 2).max(top + 4)
+}
+
 // ============================================================
 // Window procedure
 // ============================================================
@@ -690,12 +807,38 @@ unsafe extern "system" fn ask_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 LRESULT(0)
             }
 
+            m if m == WM_APP_PREFILL => {
+                // Checked here rather than at the call site so the test and the
+                // write happen on the thread that owns the control, with no gap
+                // for a keystroke to land in between.
+                let text = PENDING_PREFILL.lock().unwrap().take();
+                if let Some(text) = text {
+                    let untouched = read_text(hwnd, IDC_QUESTION).is_empty()
+                        && HISTORY.lock().unwrap().is_empty()
+                        && !*BUSY.lock().unwrap();
+                    if untouched {
+                        put_question(hwnd, &text);
+                    }
+                }
+                LRESULT(0)
+            }
+
+            // Clicking into any other window dismisses it, the way a
+            // summoned panel should.  WA_INACTIVE is the low word being 0.
+            WM_ACTIVATE => {
+                if wp.0 & 0xFFFF == 0 && *DISMISS_ON_BLUR.lock().unwrap() {
+                    let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+                }
+                LRESULT(0)
+            }
+
             WM_CLOSE => {
                 let _ = DestroyWindow(hwnd);
                 LRESULT(0)
             }
 
             WM_DESTROY => {
+                *DISMISS_ON_BLUR.lock().unwrap() = false;
                 *ASK_HWND.lock().unwrap() = 0;
                 LRESULT(0)
             }
@@ -752,6 +895,21 @@ unsafe fn paint(hwnd: HWND) {
 // ============================================================
 // Helpers
 // ============================================================
+
+/// Puts `text` in the input with the caret at its end — a starting point to add
+/// a question to, not something to overtype.
+unsafe fn put_question(hwnd: HWND, text: &str) {
+    unsafe {
+        if text.is_empty() {
+            return;
+        }
+        set_text(hwnd, IDC_QUESTION, text);
+        if let Ok(ctrl) = GetDlgItem(hwnd, IDC_QUESTION) {
+            let end = text.encode_utf16().count();
+            let _ = SendMessageW(ctrl, EM_SETSEL, WPARAM(end), LPARAM(end as isize));
+        }
+    }
+}
 
 unsafe fn focus_input(hwnd: HWND) {
     unsafe {

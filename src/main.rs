@@ -26,10 +26,11 @@ mod utils;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use utils::make_key_input;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::Com::*;
+use windows::Win32::System::DataExchange::GetClipboardSequenceNumber;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -208,7 +209,7 @@ fn dispatch_hotkey(id: i32) {
         HOTKEY_AUTOTYPE => handle_autotype_toggle(),
         HOTKEY_TASKBAR_CENTER => handle_taskbar_center_toggle(),
         HOTKEY_EXPLORER_CMD => handle_explorer_cmd(),
-        HOTKEY_ASK => ask::open(),
+        HOTKEY_ASK => handle_ask(),
         _ => {}
     }
 }
@@ -646,6 +647,60 @@ fn handle_taskbar_center_toggle() {
     });
     println!("[*] {msg}");
     popup::show("", msg, "info");
+}
+
+/// The ask hotkey is a toggle: pressed again, or with the window already up,
+/// it puts it away.  Opening carries whatever text is selected into the input
+/// without sending it, so a question can be asked *about* something.
+fn handle_ask() {
+    if ask::is_open() {
+        ask::close();
+        return;
+    }
+
+    // The copy has to go out while the source application still has focus, so
+    // it comes first — but the window must not wait on it.  Nothing selected
+    // means the clipboard never moves, and waiting out the full budget for an
+    // answer that isn't coming is exactly the case where the window is asked
+    // for with no selection at all: the common one.
+    let before = unsafe { GetClipboardSequenceNumber() };
+    simulate_copy();
+    let selection = await_copy(before, Instant::now() + SELECTION_BLOCKING_WAIT);
+
+    let had_selection = selection.is_some();
+    ask::open(selection.as_deref().unwrap_or(""));
+
+    // A loaded application can take longer than we were willing to wait.  Keep
+    // watching from a worker; the window is already up, and the text drops in
+    // if the user hasn't started typing over it.
+    if !had_selection {
+        thread::spawn(move || {
+            if let Some(text) = await_copy(before, Instant::now() + SELECTION_LATE_WAIT) {
+                ask::prefill_late(text);
+            }
+        });
+    }
+}
+
+/// How long the hotkey is willing to hold the window back waiting for a copy,
+/// and how long a straggler is still worth accepting once it is up.
+const SELECTION_BLOCKING_WAIT: Duration = Duration::from_millis(120);
+const SELECTION_LATE_WAIT: Duration = Duration::from_millis(600);
+
+/// Watches the clipboard for the result of a `Ctrl+C` we just sent, giving up
+/// at `deadline`.
+///
+/// The sequence number is what decides: it only moves when something is
+/// actually placed on the clipboard, so an unselected `Ctrl+C` can't hand back
+/// whatever happened to be there from an hour ago.
+fn await_copy(before: u32, deadline: Instant) -> Option<String> {
+    while Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+        if unsafe { GetClipboardSequenceNumber() } != before {
+            return clipboard_text();
+        }
+    }
+    None
 }
 
 fn handle_explorer_cmd() {

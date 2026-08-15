@@ -80,9 +80,13 @@ system tray with a ~20 MB memory footprint.
   screen. Type, press Enter, and the answer unfolds underneath while the input
   stays where it was; the window height follows the reply, so a one-word answer
   doesn't leave a half-empty panel and a long one scrolls. No caption, no
-  buttons — Escape dismisses it. Follow-ups keep the thread, and it answers in
-  the current UI language, since a hotkey leaves no room to ask for one. The
-  conversation lives only as long as the window: reopening starts clean.
+  buttons — Escape dismisses it, so does clicking into anything else, and so
+  does pressing the hotkey again. Whatever text is selected when the hotkey is
+  pressed arrives already in the input, unsent, so a question can be asked
+  *about* something without pasting it first. Follow-ups keep the thread, and
+  it answers in the current UI language, since a hotkey leaves no room to ask
+  for one. The conversation lives only as long as the window: reopening starts
+  clean.
 - **Taskbar icon centering** — dynamically repositions icons to the middle
   of the taskbar and keeps them centered as icons come and go.
 - **System tray** — left-click opens settings, right-click shows a
@@ -177,8 +181,10 @@ packs to be installed in Windows).
    stitched PNG.
 6. To mark something up, pick the pencil or the rectangle from the strip beside
    the selection and drag inside it, then save or copy as usual.
-7. Press `Ctrl+Tab`, type a question, press `Enter`. `Shift+Enter` breaks the
-   line instead of sending; `Esc` closes the window. Requires a DeepSeek key.
+7. Press `Ctrl+Tab`, type a question, press `Enter`. Select text first and it
+   is waiting in the input when the window opens. `Shift+Enter` breaks the line
+   instead of sending; `Esc`, a click elsewhere, or the hotkey again closes the
+   window. Requires a DeepSeek key.
 8. Click the tray icon to open settings: remap hotkeys, pick a screenshot
    folder, toggle Punto / taskbar centering / autostart.
 

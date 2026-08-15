@@ -1,6 +1,6 @@
+use crate::utils::{truncate, urlencode};
 use anyhow::{Result, anyhow};
 use base64::Engine;
-use crate::utils::{truncate, urlencode};
 use serde::Deserialize;
 
 /// Recognises text from BGRA pixels.
@@ -52,7 +52,10 @@ fn recognize_ocrspace(bgra: &[u8], width: u32, height: u32) -> Result<String> {
     let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
     let data_url = format!("data:image/png;base64,{b64}");
 
-    println!("[OCR] Отправка на OCR.space ({} KB)...", png_bytes.len() / 1024);
+    println!(
+        "[OCR] Отправка на OCR.space ({} KB)...",
+        png_bytes.len() / 1024
+    );
 
     let form_body = format!(
         "base64Image={}&language=auto&OCREngine=2&isOverlayRequired=false&scale=true&detectOrientation=true",
@@ -66,18 +69,27 @@ fn recognize_ocrspace(bgra: &[u8], width: u32, height: u32) -> Result<String> {
         .send_string(&form_body)
         .map_err(|e| anyhow!("OCR.space: {e}"))?;
 
-    let body: OcrSpaceResponse = resp.into_json()
+    let body: OcrSpaceResponse = resp
+        .into_json()
         .map_err(|e| anyhow!("OCR.space JSON: {e}"))?;
 
     if body.is_errored == Some(true) {
-        let msg = body.error_message
+        let msg = body
+            .error_message
             .map(|v| v.join("; "))
             .unwrap_or_else(|| "Unknown error".into());
         return Err(anyhow!("OCR.space: {msg}"));
     }
 
-    let text = body.parsed_results
-        .map(|results| results.into_iter().map(|r| r.parsed_text).collect::<Vec<_>>().join("\n"))
+    let text = body
+        .parsed_results
+        .map(|results| {
+            results
+                .into_iter()
+                .map(|r| r.parsed_text)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
         .unwrap_or_default();
 
     Ok(text.trim().to_string())
@@ -103,18 +115,37 @@ fn recognize_windows(bgra: &[u8], width: u32, height: u32) -> Result<String> {
         let stream = InMemoryRandomAccessStream::new().map_err(|e| anyhow!("Stream: {e}"))?;
         let encoder_id = BitmapEncoder::BmpEncoderId().map_err(|e| anyhow!("BmpEncoderId: {e}"))?;
         let encoder = BitmapEncoder::CreateAsync(encoder_id, &stream)
-            .map_err(|e| anyhow!("Encoder: {e}"))?.get().map_err(|e| anyhow!("Encoder.get: {e}"))?;
+            .map_err(|e| anyhow!("Encoder: {e}"))?
+            .get()
+            .map_err(|e| anyhow!("Encoder.get: {e}"))?;
 
-        encoder.SetPixelData(BitmapPixelFormat::Bgra8, BitmapAlphaMode::Premultiplied,
-            w, h, 96.0, 96.0, &data).map_err(|e| anyhow!("SetPixelData: {e}"))?;
-        encoder.FlushAsync().map_err(|e| anyhow!("Flush: {e}"))?
-            .get().map_err(|e| anyhow!("Flush.get: {e}"))?;
+        encoder
+            .SetPixelData(
+                BitmapPixelFormat::Bgra8,
+                BitmapAlphaMode::Premultiplied,
+                w,
+                h,
+                96.0,
+                96.0,
+                &data,
+            )
+            .map_err(|e| anyhow!("SetPixelData: {e}"))?;
+        encoder
+            .FlushAsync()
+            .map_err(|e| anyhow!("Flush: {e}"))?
+            .get()
+            .map_err(|e| anyhow!("Flush.get: {e}"))?;
         stream.Seek(0).map_err(|e| anyhow!("Seek: {e}"))?;
 
         let decoder = BitmapDecoder::CreateAsync(&stream)
-            .map_err(|e| anyhow!("Decoder: {e}"))?.get().map_err(|e| anyhow!("Decoder.get: {e}"))?;
-        let bmp = decoder.GetSoftwareBitmapAsync()
-            .map_err(|e| anyhow!("GetBitmap: {e}"))?.get().map_err(|e| anyhow!("GetBitmap.get: {e}"))?;
+            .map_err(|e| anyhow!("Decoder: {e}"))?
+            .get()
+            .map_err(|e| anyhow!("Decoder.get: {e}"))?;
+        let bmp = decoder
+            .GetSoftwareBitmapAsync()
+            .map_err(|e| anyhow!("GetBitmap: {e}"))?
+            .get()
+            .map_err(|e| anyhow!("GetBitmap.get: {e}"))?;
         SoftwareBitmap::Convert(&bmp, BitmapPixelFormat::Bgra8)
             .map_err(|e| anyhow!("Convert: {e}"))?
     };
@@ -151,8 +182,12 @@ fn recognize_windows(bgra: &[u8], width: u32, height: u32) -> Result<String> {
 
 fn scale_for_ocr(pixels: &[u8], w: u32, h: u32) -> (Vec<u8>, u32, u32) {
     let max_dim = w.max(h);
-    if max_dim < 600 { return scale(pixels, w, h, 3); }
-    if max_dim < 1200 { return scale(pixels, w, h, 2); }
+    if max_dim < 600 {
+        return scale(pixels, w, h, 3);
+    }
+    if max_dim < 1200 {
+        return scale(pixels, w, h, 2);
+    }
     (pixels.to_vec(), w, h)
 }
 

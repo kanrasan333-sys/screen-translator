@@ -14,6 +14,12 @@ use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, VARIANT};
 
+#[derive(Clone, Debug)]
+pub struct ExplorerWindowInfo {
+    pub hwnd: isize,
+    pub path: String,
+}
+
 // ============================================================
 // Registry-backed context-menu integration (Variant A)
 // ============================================================
@@ -80,14 +86,18 @@ unsafe fn install_one(root: &str) {
     unsafe {
         // HKCU\{root}\shell\ScreenTranslatorOpenCmd
         let shell_path = format!("{root}\\shell\\{MENU_KEY_NAME}");
-        let Some(hkey) = create_key(&shell_path) else { return };
+        let Some(hkey) = create_key(&shell_path) else {
+            return;
+        };
         set_default_string(hkey, MENU_TITLE);
         set_value(hkey, "Icon", "cmd.exe");
         let _ = RegCloseKey(hkey);
 
         // HKCU\{root}\shell\ScreenTranslatorOpenCmd\command
         let cmd_path = format!("{root}\\shell\\{MENU_KEY_NAME}\\command");
-        let Some(cmd_key) = create_key(&cmd_path) else { return };
+        let Some(cmd_key) = create_key(&cmd_path) else {
+            return;
+        };
         set_default_string(cmd_key, MENU_COMMAND);
         let _ = RegCloseKey(cmd_key);
     }
@@ -113,7 +123,9 @@ unsafe fn create_key(subpath: &str) -> Option<HKEY> {
         let wide = to_wide(subpath);
         let mut hkey = HKEY::default();
         let err = RegCreateKeyW(HKEY_CURRENT_USER, PCWSTR(wide.as_ptr()), &mut hkey);
-        if err.0 != 0 { return None; }
+        if err.0 != 0 {
+            return None;
+        }
         Some(hkey)
     }
 }
@@ -132,10 +144,8 @@ unsafe fn set_value(hkey: HKEY, name: &str, value: &str) {
 unsafe fn write_string(hkey: HKEY, name: PCWSTR, value: &str) {
     unsafe {
         let value_wide = to_wide(value);
-        let bytes = std::slice::from_raw_parts(
-            value_wide.as_ptr() as *const u8,
-            value_wide.len() * 2,
-        );
+        let bytes =
+            std::slice::from_raw_parts(value_wide.as_ptr() as *const u8, value_wide.len() * 2);
         let _ = RegSetValueExW(hkey, name, 0, REG_SZ, Some(bytes));
     }
 }
@@ -150,6 +160,43 @@ unsafe fn write_string(hkey: HKEY, name: PCWSTR, value: &str) {
 pub fn open_in_active_folder() {
     let path = active_explorer_path().unwrap_or_else(home_dir);
     open_cmd_in(&path);
+}
+
+/// Returns all open filesystem-backed Explorer windows.
+pub fn list_open_folders() -> Vec<ExplorerWindowInfo> {
+    unsafe {
+        let shell_windows: IShellWindows = match CoCreateInstance(&ShellWindows, None, CLSCTX_ALL) {
+            Ok(v) => v,
+            Err(_) => return Vec::new(),
+        };
+        let Ok(count) = shell_windows.Count() else {
+            return Vec::new();
+        };
+
+        let mut items = Vec::new();
+        for i in 0..count {
+            let Ok(disp) = shell_windows.Item(&VARIANT::from(i)) else {
+                continue;
+            };
+            let Ok(app) = disp.cast::<IWebBrowserApp>() else {
+                continue;
+            };
+            let Ok(hwnd_handle) = app.HWND() else {
+                continue;
+            };
+            let Some(path) = current_folder_for_app(&app) else {
+                continue;
+            };
+            if path.is_empty() {
+                continue;
+            }
+            items.push(ExplorerWindowInfo {
+                hwnd: hwnd_handle.0,
+                path,
+            });
+        }
+        items
+    }
 }
 
 fn home_dir() -> String {
@@ -176,41 +223,47 @@ fn open_cmd_in(folder: &str) {
 /// matches `GetForegroundWindow()`, and returns the filesystem path of
 /// its active folder.
 fn active_explorer_path() -> Option<String> {
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground.0.is_null() {
+        return None;
+    }
+    let fg_value = foreground.0 as isize;
+    list_open_folders()
+        .into_iter()
+        .find(|item| item.hwnd == fg_value)
+        .map(|item| item.path)
+}
+
+fn current_folder_for_app(app: &IWebBrowserApp) -> Option<String> {
     unsafe {
-        let foreground = GetForegroundWindow();
-        if foreground.0.is_null() { return None; }
-        let fg_value = foreground.0 as isize;
+        let Ok(sp) = app.cast::<IServiceProvider>() else {
+            return None;
+        };
+        let Ok(browser) = sp.QueryService::<IShellBrowser>(&SID_STopLevelBrowser) else {
+            return None;
+        };
+        let Ok(view) = browser.QueryActiveShellView() else {
+            return None;
+        };
+        let Ok(folder_view) = view.cast::<IFolderView>() else {
+            return None;
+        };
+        let Ok(persist) = folder_view.GetFolder::<IPersistFolder2>() else {
+            return None;
+        };
+        let Ok(pidl) = persist.GetCurFolder() else {
+            return None;
+        };
 
-        let shell_windows: IShellWindows =
-            CoCreateInstance(&ShellWindows, None, CLSCTX_ALL).ok()?;
-        let count = shell_windows.Count().ok()?;
-
-        for i in 0..count {
-            let Ok(disp) = shell_windows.Item(&VARIANT::from(i)) else { continue };
-            let Ok(app) = disp.cast::<IWebBrowserApp>() else { continue };
-            let Ok(hwnd_handle) = app.HWND() else { continue };
-            // SHANDLE_PTR is isize-sized; compare to the foreground HWND.
-            if hwnd_handle.0 != fg_value { continue }
-
-            let Ok(sp) = app.cast::<IServiceProvider>() else { continue };
-            let Ok(browser) = sp.QueryService::<IShellBrowser>(&SID_STopLevelBrowser)
-                else { continue };
-            let Ok(view) = browser.QueryActiveShellView() else { continue };
-            let Ok(folder_view) = view.cast::<IFolderView>() else { continue };
-            let Ok(persist) = folder_view.GetFolder::<IPersistFolder2>() else { continue };
-            let Ok(pidl) = persist.GetCurFolder() else { continue };
-
-            let mut buf = [0u16; 260];
-            let ok = SHGetPathFromIDListW(pidl, &mut buf);
-            CoTaskMemFree(Some(pidl as *const ITEMIDLIST as *const _));
-            if !ok.as_bool() { continue }
-
-            let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-            let path = String::from_utf16_lossy(&buf[..len]);
-            if !path.is_empty() {
-                return Some(path);
-            }
+        let mut buf = [0u16; 260];
+        let ok = SHGetPathFromIDListW(pidl, &mut buf);
+        CoTaskMemFree(Some(pidl as *const ITEMIDLIST as *const _));
+        if !ok.as_bool() {
+            return None;
         }
-        None
+
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        let path = String::from_utf16_lossy(&buf[..len]);
+        if path.is_empty() { None } else { Some(path) }
     }
 }

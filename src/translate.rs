@@ -1,7 +1,8 @@
-use anyhow::{Result, anyhow};
+use crate::deepseek;
 use crate::i18n;
 use crate::settings;
 use crate::utils::{truncate, urlencode};
+use anyhow::{Result, anyhow};
 use serde::Deserialize;
 
 /// Translates text. Uses DeepSeek if an API key is configured, otherwise
@@ -29,39 +30,8 @@ pub fn translate(text: &str) -> Result<(String, String)> {
 }
 
 // ============================================================
-// DeepSeek (OpenAI-compatible chat completions)
+// DeepSeek
 // ============================================================
-
-const DEEPSEEK_URL: &str = "https://api.deepseek.com/chat/completions";
-
-#[derive(serde::Serialize)]
-struct ChatRequest<'a> {
-    model: &'a str,
-    messages: Vec<ChatMessage<'a>>,
-    temperature: f32,
-    stream: bool,
-}
-
-#[derive(serde::Serialize)]
-struct ChatMessage<'a> {
-    role: &'a str,
-    content: &'a str,
-}
-
-#[derive(Deserialize)]
-struct ChatResponse {
-    choices: Vec<ChatChoice>,
-}
-
-#[derive(Deserialize)]
-struct ChatChoice {
-    message: ChatChoiceMessage,
-}
-
-#[derive(Deserialize)]
-struct ChatChoiceMessage {
-    content: String,
-}
 
 fn translate_deepseek(text: &str, from: &str, to: &str, api_key: &str) -> Result<String> {
     let system_prompt = format!(
@@ -70,35 +40,13 @@ fn translate_deepseek(text: &str, from: &str, to: &str, api_key: &str) -> Result
          no commentary. Preserve line breaks and formatting."
     );
 
-    let req = ChatRequest {
-        model: "deepseek-chat",
-        messages: vec![
-            ChatMessage { role: "system", content: &system_prompt },
-            ChatMessage { role: "user",   content: text },
-        ],
-        temperature: 0.2,
-        stream: false,
-    };
-
     println!("[translate] DeepSeek: {from} -> {to}");
 
-    let resp = ureq::post(DEEPSEEK_URL)
-        .timeout(std::time::Duration::from_secs(30))
-        .set("Authorization", &format!("Bearer {api_key}"))
-        .set("Content-Type", "application/json")
-        .send_json(serde_json::to_value(&req).map_err(|e| anyhow!("JSON: {e}"))?)
-        .map_err(|e| anyhow!("Сеть: {e}"))?;
-
-    let body: ChatResponse = resp.into_json()
-        .map_err(|e| anyhow!("JSON: {e}"))?;
-
-    let translated = body.choices.into_iter().next()
-        .map(|c| c.message.content.trim().to_string())
-        .ok_or_else(|| anyhow!("пустой ответ"))?;
-
-    if translated.is_empty() {
-        return Err(anyhow!("пустой перевод"));
-    }
+    let turns = [
+        deepseek::Turn::system(system_prompt),
+        deepseek::Turn::user(text),
+    ];
+    let translated = deepseek::chat(api_key, &turns, 0.2, 30)?;
 
     println!("[translate] DeepSeek OK: {}...", truncate(&translated, 60));
     Ok(translated)
@@ -125,7 +73,9 @@ struct MyMemoryData {
 fn translate_mymemory(text: &str, from: &str, to: &str) -> Result<String> {
     let url = format!(
         "https://api.mymemory.translated.net/get?q={}&langpair={}|{}",
-        urlencode(text), from, to,
+        urlencode(text),
+        from,
+        to,
     );
 
     println!("[translate] MyMemory: {}", truncate(&url, 120));
@@ -135,14 +85,16 @@ fn translate_mymemory(text: &str, from: &str, to: &str) -> Result<String> {
         .call()
         .map_err(|e| anyhow!("Сеть: {e}"))?;
 
-    let body: MyMemoryResponse = resp.into_json()
-        .map_err(|e| anyhow!("JSON: {e}"))?;
+    let body: MyMemoryResponse = resp.into_json().map_err(|e| anyhow!("JSON: {e}"))?;
 
     if body.status != 200 {
         return Err(anyhow!("API статус {}", body.status));
     }
 
-    println!("[translate] MyMemory OK: {}...", truncate(&body.data.translated_text, 60));
+    println!(
+        "[translate] MyMemory OK: {}...",
+        truncate(&body.data.translated_text, 60)
+    );
     Ok(body.data.translated_text)
 }
 
@@ -174,9 +126,9 @@ fn lang_eq(a: &str, b: &str) -> bool {
 fn detect_source(text: &str) -> &'static str {
     let mut cyrillic = 0usize;
     let mut ukrainian_spec = 0usize;
-    let mut kana = 0usize;      // Hiragana/Katakana (Japanese)
-    let mut hangul = 0usize;    // Korean
-    let mut han = 0usize;       // Chinese/Japanese Han
+    let mut kana = 0usize; // Hiragana/Katakana (Japanese)
+    let mut hangul = 0usize; // Korean
+    let mut han = 0usize; // Chinese/Japanese Han
     let mut arabic = 0usize;
     let mut hebrew = 0usize;
     let mut greek = 0usize;
@@ -211,18 +163,39 @@ fn detect_source(text: &str) -> &'static str {
             0x0900..=0x097F => devanagari += 1,
             _ if c.is_ascii_alphabetic() => latin += 1,
             _ => match c {
-                'ß' | 'ä' | 'Ä' | 'ö' | 'Ö' | 'ü' | 'Ü' => { latin += 1; de_spec += 1; }
-                'ñ' | 'Ñ' => { latin += 1; es_spec += 1; }
-                '¿' | '¡' => { es_spec += 1; }
-                'ã' | 'Ã' | 'õ' | 'Õ' => { latin += 1; pt_spec += 1; }
-                'ç' | 'Ç' | 'œ' | 'Œ' => { latin += 1; fr_spec += 1; }
-                'ą'|'Ą'|'ć'|'Ć'|'ę'|'Ę'|'ł'|'Ł'|'ń'|'Ń'|'ś'|'Ś'|'ź'|'Ź'|'ż'|'Ż' => {
-                    latin += 1; pl_spec += 1;
+                'ß' | 'ä' | 'Ä' | 'ö' | 'Ö' | 'ü' | 'Ü' => {
+                    latin += 1;
+                    de_spec += 1;
                 }
-                'ğ' | 'Ğ' | 'ı' | 'İ' | 'ş' | 'Ş' => { latin += 1; tr_spec += 1; }
-                'à'|'À'|'è'|'È'|'é'|'É'|'ì'|'Ì'|'í'|'Í'|'ò'|'Ò'|'ó'|'Ó'|'ù'|'Ù'|'ú'|'Ú'
-                |'â'|'Â'|'ê'|'Ê'|'î'|'Î'|'ô'|'Ô'|'û'|'Û'|'ï'|'Ï' => {
-                    latin += 1; romance_accent += 1;
+                'ñ' | 'Ñ' => {
+                    latin += 1;
+                    es_spec += 1;
+                }
+                '¿' | '¡' => {
+                    es_spec += 1;
+                }
+                'ã' | 'Ã' | 'õ' | 'Õ' => {
+                    latin += 1;
+                    pt_spec += 1;
+                }
+                'ç' | 'Ç' | 'œ' | 'Œ' => {
+                    latin += 1;
+                    fr_spec += 1;
+                }
+                'ą' | 'Ą' | 'ć' | 'Ć' | 'ę' | 'Ę' | 'ł' | 'Ł' | 'ń' | 'Ń' | 'ś' | 'Ś' | 'ź'
+                | 'Ź' | 'ż' | 'Ż' => {
+                    latin += 1;
+                    pl_spec += 1;
+                }
+                'ğ' | 'Ğ' | 'ı' | 'İ' | 'ş' | 'Ş' => {
+                    latin += 1;
+                    tr_spec += 1;
+                }
+                'à' | 'À' | 'è' | 'È' | 'é' | 'É' | 'ì' | 'Ì' | 'í' | 'Í' | 'ò' | 'Ò' | 'ó'
+                | 'Ó' | 'ù' | 'Ù' | 'ú' | 'Ú' | 'â' | 'Â' | 'ê' | 'Ê' | 'î' | 'Î' | 'ô' | 'Ô'
+                | 'û' | 'Û' | 'ï' | 'Ï' => {
+                    latin += 1;
+                    romance_accent += 1;
                 }
                 _ => {}
             },
@@ -230,25 +203,55 @@ fn detect_source(text: &str) -> &'static str {
     }
 
     // Non-Latin scripts — pick in order of distinctiveness.
-    if kana > 0 { return "ja"; }                    // Japanese (any kana)
-    if hangul > 0 { return "ko"; }                  // Korean
-    if han > 0 { return "zh-CN"; }                  // Chinese (Han only)
+    if kana > 0 {
+        return "ja";
+    } // Japanese (any kana)
+    if hangul > 0 {
+        return "ko";
+    } // Korean
+    if han > 0 {
+        return "zh-CN";
+    } // Chinese (Han only)
     if cyrillic > latin {
         return if ukrainian_spec > 0 { "uk" } else { "ru" };
     }
-    if arabic > 0 { return "ar"; }
-    if hebrew > 0 { return "he"; }
-    if greek > 0 { return "el"; }
-    if thai > 0 { return "th"; }
-    if devanagari > 0 { return "hi"; }
+    if arabic > 0 {
+        return "ar";
+    }
+    if hebrew > 0 {
+        return "he";
+    }
+    if greek > 0 {
+        return "el";
+    }
+    if thai > 0 {
+        return "th";
+    }
+    if devanagari > 0 {
+        return "hi";
+    }
 
     // Latin scripts — distinctive markers first, then generic romance, then English.
-    if pl_spec > 0 { return "pl"; }
-    if tr_spec > 0 { return "tr"; }
-    if de_spec > 0 { return "de"; }
-    if es_spec > 0 { return "es"; }
-    if pt_spec > 0 { return "pt"; }
-    if fr_spec > 0 { return "fr"; }
-    if romance_accent > 0 { return "it"; }
+    if pl_spec > 0 {
+        return "pl";
+    }
+    if tr_spec > 0 {
+        return "tr";
+    }
+    if de_spec > 0 {
+        return "de";
+    }
+    if es_spec > 0 {
+        return "es";
+    }
+    if pt_spec > 0 {
+        return "pt";
+    }
+    if fr_spec > 0 {
+        return "fr";
+    }
+    if romance_accent > 0 {
+        return "it";
+    }
     "en"
 }

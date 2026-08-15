@@ -18,16 +18,12 @@ pub fn is_enabled() -> bool {
             KEY_READ,
             &mut hkey,
         );
-        if err.0 != 0 { return false; }
+        if err.0 != 0 {
+            return false;
+        }
 
-        let exists = RegQueryValueExW(
-            hkey,
-            PCWSTR(value_name.as_ptr()),
-            None,
-            None,
-            None,
-            None,
-        ).0 == 0;
+        let exists =
+            RegQueryValueExW(hkey, PCWSTR(value_name.as_ptr()), None, None, None, None).0 == 0;
 
         let _ = RegCloseKey(hkey);
         exists
@@ -47,23 +43,17 @@ pub fn set_enabled(enable: bool) {
             KEY_SET_VALUE,
             &mut hkey,
         );
-        if err.0 != 0 { return; }
+        if err.0 != 0 {
+            return;
+        }
 
         if enable {
             if let Ok(exe) = std::env::current_exe() {
                 let exe_str = format_run_command(&exe);
                 let exe_wide = to_wide(&exe_str);
-                let bytes = std::slice::from_raw_parts(
-                    exe_wide.as_ptr() as *const u8,
-                    exe_wide.len() * 2,
-                );
-                let _ = RegSetValueExW(
-                    hkey,
-                    PCWSTR(value_name.as_ptr()),
-                    0,
-                    REG_SZ,
-                    Some(bytes),
-                );
+                let bytes =
+                    std::slice::from_raw_parts(exe_wide.as_ptr() as *const u8, exe_wide.len() * 2);
+                let _ = RegSetValueExW(hkey, PCWSTR(value_name.as_ptr()), 0, REG_SZ, Some(bytes));
             }
         } else {
             let _ = RegDeleteValueW(hkey, PCWSTR(value_name.as_ptr()));
@@ -84,7 +74,12 @@ mod tests {
 
     #[test]
     fn quotes_executable_path_for_run_key() {
-        let cmd = format_run_command(Path::new(r"C:\Program Files\Screen Translator\screen-translator.exe"));
-        assert_eq!(cmd, r#""C:\Program Files\Screen Translator\screen-translator.exe""#);
+        let cmd = format_run_command(Path::new(
+            r"C:\Program Files\Screen Translator\screen-translator.exe",
+        ));
+        assert_eq!(
+            cmd,
+            r#""C:\Program Files\Screen Translator\screen-translator.exe""#
+        );
     }
 }

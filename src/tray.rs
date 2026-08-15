@@ -34,7 +34,9 @@ static TRAY_HWND: Mutex<isize> = Mutex::new(0);
 
 pub fn create() {
     unsafe {
-        let Some(hmodule) = GetModuleHandleW(None).ok() else { return };
+        let Some(hmodule) = GetModuleHandleW(None).ok() else {
+            return;
+        };
         let hinstance = HINSTANCE(hmodule.0);
         let class = w!("ScrTransTray");
 
@@ -48,13 +50,23 @@ pub fn create() {
 
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
-            class, w!(""),
+            class,
+            w!(""),
             WINDOW_STYLE(0),
-            0, 0, 0, 0,
-            HWND::default(), HMENU::default(), hinstance, None,
-        ).unwrap_or_default();
+            0,
+            0,
+            0,
+            0,
+            HWND::default(),
+            HMENU::default(),
+            hinstance,
+            None,
+        )
+        .unwrap_or_default();
 
-        if hwnd.0.is_null() { return; }
+        if hwnd.0.is_null() {
+            return;
+        }
         *TRAY_HWND.lock().unwrap() = hwnd.0 as isize;
 
         add_icon(hwnd);
@@ -64,7 +76,9 @@ pub fn create() {
 pub fn destroy() {
     unsafe {
         let v = *TRAY_HWND.lock().unwrap();
-        if v == 0 { return; }
+        if v == 0 {
+            return;
+        }
         let hwnd = HWND(v as *mut _);
         remove_icon(hwnd);
         let _ = DestroyWindow(hwnd);
@@ -90,7 +104,9 @@ unsafe fn add_icon(hwnd: HWND) {
 
         let tip = "Screen Translator";
         for (i, c) in tip.encode_utf16().enumerate() {
-            if i >= 127 { break; }
+            if i >= 127 {
+                break;
+            }
             nid.szTip[i] = c;
         }
 
@@ -119,7 +135,12 @@ unsafe fn show_context_menu(hwnd: HWND) {
         let text_settings = to_wide(i18n::t("tray.menu.settings"));
         let text_exit = to_wide(i18n::t("tray.menu.exit"));
 
-        let _ = AppendMenuW(menu, MF_STRING, IDM_SETTINGS, PCWSTR(text_settings.as_ptr()));
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            IDM_SETTINGS,
+            PCWSTR(text_settings.as_ptr()),
+        );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, IDM_EXIT, PCWSTR(text_exit.as_ptr()));
 
@@ -131,7 +152,11 @@ unsafe fn show_context_menu(hwnd: HWND) {
         let _ = TrackPopupMenu(
             menu,
             TPM_RIGHTALIGN | TPM_BOTTOMALIGN,
-            pt.x, pt.y, 0, hwnd, None,
+            pt.x,
+            pt.y,
+            0,
+            hwnd,
+            None,
         );
         // Standard tray menu fix
         let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
@@ -143,9 +168,7 @@ unsafe fn show_context_menu(hwnd: HWND) {
 // Window procedure
 // ============================================================
 
-unsafe extern "system" fn tray_proc(
-    hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM,
-) -> LRESULT {
+unsafe extern "system" fn tray_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         match msg {
             WM_TRAYICON => {
@@ -155,7 +178,8 @@ unsafe extern "system" fn tray_proc(
                         let _ = PostThreadMessageW(
                             GetCurrentThreadId(),
                             WM_TRAY_OPEN_SETTINGS,
-                            WPARAM(0), LPARAM(0),
+                            WPARAM(0),
+                            LPARAM(0),
                         );
                     }
                     WM_RBUTTONUP => {
@@ -171,7 +195,8 @@ unsafe extern "system" fn tray_proc(
                         let _ = PostThreadMessageW(
                             GetCurrentThreadId(),
                             WM_TRAY_OPEN_SETTINGS,
-                            WPARAM(0), LPARAM(0),
+                            WPARAM(0),
+                            LPARAM(0),
                         );
                     }
                     IDM_EXIT => {

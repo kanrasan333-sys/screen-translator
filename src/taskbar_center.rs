@@ -1,9 +1,9 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use windows::core::{Interface, PCWSTR, VARIANT};
+use std::sync::atomic::{AtomicBool, Ordering};
 use windows::Win32::Foundation::*;
 use windows::Win32::UI::Accessibility::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
+use windows::core::{Interface, PCWSTR, VARIANT};
 
 use crate::utils::to_wide;
 
@@ -205,16 +205,13 @@ fn find_primary_task_list() -> Option<(HWND, HWND)> {
         let tray = FindWindowW(PCWSTR(cls_tray.as_ptr()), PCWSTR::null()).ok()?;
 
         let cls_rebar = to_wide("ReBarWindow32");
-        let rebar =
-            FindWindowExW(tray, None, PCWSTR(cls_rebar.as_ptr()), PCWSTR::null()).ok()?;
+        let rebar = FindWindowExW(tray, None, PCWSTR(cls_rebar.as_ptr()), PCWSTR::null()).ok()?;
 
         let cls_sw = to_wide("MSTaskSwWClass");
-        let sw =
-            FindWindowExW(rebar, None, PCWSTR(cls_sw.as_ptr()), PCWSTR::null()).ok()?;
+        let sw = FindWindowExW(rebar, None, PCWSTR(cls_sw.as_ptr()), PCWSTR::null()).ok()?;
 
         let cls_list = to_wide("MSTaskListWClass");
-        let list =
-            FindWindowExW(sw, None, PCWSTR(cls_list.as_ptr()), PCWSTR::null()).ok()?;
+        let list = FindWindowExW(sw, None, PCWSTR(cls_list.as_ptr()), PCWSTR::null()).ok()?;
 
         Some((sw, list))
     }
@@ -228,33 +225,17 @@ fn find_secondary_task_lists() -> Vec<(HWND, HWND)> {
         let cls_sw = to_wide("MSTaskSwWClass");
         let cls_list = to_wide("MSTaskListWClass");
 
-        let mut tray =
-            FindWindowW(PCWSTR(cls_sec.as_ptr()), PCWSTR::null()).unwrap_or_default();
+        let mut tray = FindWindowW(PCWSTR(cls_sec.as_ptr()), PCWSTR::null()).unwrap_or_default();
 
         while !tray.0.is_null() {
-            let worker = FindWindowExW(
-                tray,
-                None,
-                PCWSTR(cls_worker.as_ptr()),
-                PCWSTR::null(),
-            )
-            .unwrap_or_default();
+            let worker = FindWindowExW(tray, None, PCWSTR(cls_worker.as_ptr()), PCWSTR::null())
+                .unwrap_or_default();
 
-            let sw = FindWindowExW(
-                worker,
-                None,
-                PCWSTR(cls_sw.as_ptr()),
-                PCWSTR::null(),
-            )
-            .unwrap_or_default();
+            let sw = FindWindowExW(worker, None, PCWSTR(cls_sw.as_ptr()), PCWSTR::null())
+                .unwrap_or_default();
 
-            let list = FindWindowExW(
-                sw,
-                None,
-                PCWSTR(cls_list.as_ptr()),
-                PCWSTR::null(),
-            )
-            .unwrap_or_default();
+            let list = FindWindowExW(sw, None, PCWSTR(cls_list.as_ptr()), PCWSTR::null())
+                .unwrap_or_default();
 
             if !sw.0.is_null() && !list.0.is_null() {
                 result.push((sw, list));

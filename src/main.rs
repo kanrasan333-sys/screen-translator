@@ -1,24 +1,30 @@
 #![windows_subsystem = "windows"]
 
 mod autostart;
+mod ask;
 mod autotype;
+mod button;
 mod capture;
+mod deepseek;
 mod explorer_cmd;
 mod i18n;
 mod layout;
 mod ocr;
+mod paint;
 mod popup;
 mod screenshot;
+mod scroll_capture;
 mod settings;
 mod settings_ui;
 mod taskbar_center;
 mod theme;
 mod translate;
 mod tray;
+mod uia_scroll;
 mod utils;
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::Duration;
 use utils::make_key_input;
@@ -40,8 +46,9 @@ const HOTKEY_SETTINGS: i32 = 5;
 const HOTKEY_AUTOTYPE: i32 = 6;
 const HOTKEY_TASKBAR_CENTER: i32 = 7;
 const HOTKEY_EXPLORER_CMD: i32 = 8;
+const HOTKEY_ASK: i32 = 9;
 
-const ALL_HOTKEY_IDS: [i32; 8] = [
+const ALL_HOTKEY_IDS: [i32; 9] = [
     HOTKEY_TRANSLATE,
     HOTKEY_OCR,
     HOTKEY_SCREENSHOT,
@@ -50,6 +57,7 @@ const ALL_HOTKEY_IDS: [i32; 8] = [
     HOTKEY_AUTOTYPE,
     HOTKEY_TASKBAR_CENTER,
     HOTKEY_EXPLORER_CMD,
+    HOTKEY_ASK,
 ];
 
 // ============================================================
@@ -108,8 +116,8 @@ fn wake_main_thread() {
 // ============================================================
 
 fn main() {
-    // Redirect stdout/stderr to NUL so println! doesn't panic in GUI mode
-    redirect_stdio_to_nul();
+    // Redirect stdout/stderr to a log file so println! doesn't panic in GUI mode
+    redirect_stdio_to_log();
 
     unsafe {
         MAIN_THREAD_ID.store(GetCurrentThreadId(), Ordering::Relaxed);
@@ -134,7 +142,6 @@ fn main() {
     run_main_loop();
     tray::destroy();
 }
-
 
 fn run_main_loop() {
     let mut msg = MSG::default();
@@ -201,6 +208,7 @@ fn dispatch_hotkey(id: i32) {
         HOTKEY_AUTOTYPE => handle_autotype_toggle(),
         HOTKEY_TASKBAR_CENTER => handle_taskbar_center_toggle(),
         HOTKEY_EXPLORER_CMD => handle_explorer_cmd(),
+        HOTKEY_ASK => ask::open(),
         _ => {}
     }
 }
@@ -242,21 +250,36 @@ fn register_hotkeys(s: &settings::Settings) -> Vec<String> {
             required: true,
         },
         HotkeyRegistration {
+            id: HOTKEY_ASK,
+            label: i18n::t("settings.hotkey.ask").to_string(),
+            config: s.hk_ask.clone(),
+            required: true,
+        },
+        HotkeyRegistration {
             id: HOTKEY_SETTINGS,
             label: "Settings window".to_string(),
-            config: settings::HotkeyConfig { modifiers: 0x0003, vk: 0x4F },
+            config: settings::HotkeyConfig {
+                modifiers: 0x0003,
+                vk: 0x4F,
+            },
             required: false,
         },
         HotkeyRegistration {
             id: HOTKEY_AUTOTYPE,
             label: "Toggle auto layout correction".to_string(),
-            config: settings::HotkeyConfig { modifiers: 0x0003, vk: 0x41 },
+            config: settings::HotkeyConfig {
+                modifiers: 0x0003,
+                vk: 0x41,
+            },
             required: false,
         },
         HotkeyRegistration {
             id: HOTKEY_TASKBAR_CENTER,
             label: "Toggle taskbar centering".to_string(),
-            config: settings::HotkeyConfig { modifiers: 0x0003, vk: 0x4D },
+            config: settings::HotkeyConfig {
+                modifiers: 0x0003,
+                vk: 0x4D,
+            },
             required: false,
         },
     ];
@@ -264,14 +287,22 @@ fn register_hotkeys(s: &settings::Settings) -> Vec<String> {
     let mut failures = Vec::new();
     unsafe {
         for reg in registrations {
-            if RegisterHotKey(None, reg.id, HOT_KEY_MODIFIERS(reg.config.modifiers), reg.config.vk)
-                .is_err()
+            if RegisterHotKey(
+                None,
+                reg.id,
+                HOT_KEY_MODIFIERS(reg.config.modifiers),
+                reg.config.vk,
+            )
+            .is_err()
             {
                 if reg.required {
                     failures.push(format!("{} ({})", reg.label, reg.config.display()));
                 } else {
-                    println!("[!] Optional hotkey skipped: {} ({})",
-                        reg.label, reg.config.display());
+                    println!(
+                        "[!] Optional hotkey skipped: {} ({})",
+                        reg.label,
+                        reg.config.display()
+                    );
                 }
             }
         }
@@ -293,7 +324,10 @@ fn show_hotkey_registration_failures(failures: &[String]) {
     }
 
     let details = failures.join("\n");
-    let message = format!("{}Hotkey unavailable:\n{details}", i18n::t("popup.error_prefix"));
+    let message = format!(
+        "{}Hotkey unavailable:\n{details}",
+        i18n::t("popup.error_prefix")
+    );
     println!("[!] {message}");
     popup::show("", &message, "error");
 }
@@ -319,8 +353,17 @@ fn handle_text_translate() {
         init_com_in_thread();
         let result = match translate::translate(&text) {
             Ok((translated, direction)) => {
-                println!("[+] Translated ({}): {}...", direction, utils::truncate(&translated, 80));
-                TranslationResult { original: text, translated, direction, is_error: false }
+                println!(
+                    "[+] Translated ({}): {}...",
+                    direction,
+                    utils::truncate(&translated, 80)
+                );
+                TranslationResult {
+                    original: text,
+                    translated,
+                    direction,
+                    is_error: false,
+                }
             }
             Err(e) => {
                 println!("[!] Translation error: {e}");
@@ -352,7 +395,29 @@ fn dispatch_capture_result(result: Option<capture::CaptureAction>) {
         Some(capture::CaptureAction::Translate(p, w, h)) => do_ocr_and_translate(&p, w, h),
         Some(capture::CaptureAction::Save(p, w, h)) => save_captured(&p, w, h),
         Some(capture::CaptureAction::Clipboard(p, w, h)) => copy_to_clipboard(&p, w, h),
+        Some(capture::CaptureAction::FullPage { x, y, w, h }) => capture_full_page(x, y, w, h),
         None => println!("[*] Cancelled"),
+    }
+}
+
+/// Scroll-captures the selected region and hands the stitched strip to the
+/// regular save flow.  Runs on the main thread: it drives the mouse wheel and
+/// grabs the live screen, so nothing else may paint over the region meanwhile.
+fn capture_full_page(x: i32, y: i32, w: i32, h: i32) {
+    println!("[*] Scrolling capture of {w}x{h} at {x},{y}...");
+    match scroll_capture::capture(x, y, w, h) {
+        Ok((pixels, pw, ph)) => {
+            println!("[+] Stitched {pw}x{ph}");
+            save_captured(&pixels, pw, ph);
+        }
+        Err(e) => {
+            println!("[!] Full-page capture error: {e}");
+            popup::show(
+                "",
+                &format!("{}{e}", i18n::t("popup.error_prefix")),
+                "error",
+            );
+        }
     }
 }
 
@@ -403,7 +468,12 @@ fn do_ocr_and_translate(pixels: &[u8], width: u32, height: u32) {
         let result = match translate::translate(&text) {
             Ok((translated, direction)) => {
                 println!("[+] Translated: {}...", utils::truncate(&translated, 80));
-                TranslationResult { original: text, translated, direction, is_error: false }
+                TranslationResult {
+                    original: text,
+                    translated,
+                    direction,
+                    is_error: false,
+                }
             }
             Err(e) => {
                 println!("[!] Translation error: {e}");
@@ -428,12 +498,20 @@ fn save_captured(pixels: &[u8], width: u32, height: u32) {
     match save_with_dialog(pixels, width, height) {
         Ok(Some(path)) => {
             println!("[+] Screenshot saved: {path}");
-            popup::show("", &format!("{}:\n{}", i18n::t("popup.screenshot_saved"), path), "info");
+            popup::show(
+                "",
+                &format!("{}:\n{}", i18n::t("popup.screenshot_saved"), path),
+                "info",
+            );
         }
         Ok(None) => println!("[*] Save cancelled"),
         Err(e) => {
             println!("[!] Save error: {e}");
-            popup::show("", &format!("{}{e}", i18n::t("popup.error_prefix")), "error");
+            popup::show(
+                "",
+                &format!("{}{e}", i18n::t("popup.error_prefix")),
+                "error",
+            );
         }
     }
 }
@@ -458,9 +536,14 @@ fn save_with_dialog(pixels: &[u8], width: u32, height: u32) -> anyhow::Result<Op
 
 fn pick_png_save_path(initial_folder: Option<String>) -> anyhow::Result<Option<String>> {
     thread::spawn(move || -> anyhow::Result<Option<String>> {
-        use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, COINIT_APARTMENTTHREADED, CLSCTX_ALL};
+        use windows::Win32::System::Com::{
+            CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoTaskMemFree,
+        };
         use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
-        use windows::Win32::UI::Shell::{FileSaveDialog, IFileSaveDialog, IShellItem, SHCreateItemFromParsingName, SIGDN_FILESYSPATH};
+        use windows::Win32::UI::Shell::{
+            FileSaveDialog, IFileSaveDialog, IShellItem, SHCreateItemFromParsingName,
+            SIGDN_FILESYSPATH,
+        };
         use windows::core::PCWSTR;
 
         unsafe {
@@ -469,9 +552,8 @@ fn pick_png_save_path(initial_folder: Option<String>) -> anyhow::Result<Option<S
                 .map_err(|e| anyhow::anyhow!("CoInitializeEx: {e}"))?;
             let _guard = StaComGuard;
 
-            let dialog: IFileSaveDialog =
-                CoCreateInstance(&FileSaveDialog, None, CLSCTX_ALL)
-                    .map_err(|e| anyhow::anyhow!("Dialog: {e}"))?;
+            let dialog: IFileSaveDialog = CoCreateInstance(&FileSaveDialog, None, CLSCTX_ALL)
+                .map_err(|e| anyhow::anyhow!("Dialog: {e}"))?;
 
             let filter_name = utils::to_wide("PNG (*.png)");
             let filter_ext = utils::to_wide("*.png");
@@ -483,14 +565,16 @@ fn pick_png_save_path(initial_folder: Option<String>) -> anyhow::Result<Option<S
             let _ = dialog.SetDefaultExtension(windows::core::w!("png"));
 
             let now = chrono::Local::now();
-            let default_name = utils::to_wide(&now.format("screenshot_%Y%m%d_%H%M%S.png").to_string());
+            let default_name =
+                utils::to_wide(&now.format("screenshot_%Y%m%d_%H%M%S.png").to_string());
             let _ = dialog.SetFileName(PCWSTR(default_name.as_ptr()));
 
             if let Some(folder) = initial_folder.as_ref() {
                 let folder_wide = utils::to_wide(folder);
-                if let Ok(item) =
-                    SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(folder_wide.as_ptr()), None)
-                {
+                if let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(
+                    PCWSTR(folder_wide.as_ptr()),
+                    None,
+                ) {
                     let _ = dialog.SetFolder(&item);
                 }
             }
@@ -499,7 +583,9 @@ fn pick_png_save_path(initial_folder: Option<String>) -> anyhow::Result<Option<S
                 return Ok(None);
             }
 
-            let result = dialog.GetResult().map_err(|e| anyhow::anyhow!("GetResult: {e}"))?;
+            let result = dialog
+                .GetResult()
+                .map_err(|e| anyhow::anyhow!("GetResult: {e}"))?;
             let path = result
                 .GetDisplayName(SIGDN_FILESYSPATH)
                 .map_err(|e| anyhow::anyhow!("GetPath: {e}"))?;
@@ -523,7 +609,11 @@ fn handle_layout_switch() {
     };
 
     let converted = layout::convert(&text);
-    println!("[+] {} -> {}", utils::truncate(&text, 40), utils::truncate(&converted, 40));
+    println!(
+        "[+] {} -> {}",
+        utils::truncate(&text, 40),
+        utils::truncate(&converted, 40)
+    );
 
     if let Ok(mut cb) = arboard::Clipboard::new() {
         let _ = cb.set_text(&converted);
@@ -538,14 +628,22 @@ fn handle_settings() {
 
 fn handle_autotype_toggle() {
     let enabled = autotype::toggle();
-    let msg = i18n::t(if enabled { "popup.autotype_on" } else { "popup.autotype_off" });
+    let msg = i18n::t(if enabled {
+        "popup.autotype_on"
+    } else {
+        "popup.autotype_off"
+    });
     println!("[*] {msg}");
     popup::show("", msg, "info");
 }
 
 fn handle_taskbar_center_toggle() {
     let enabled = taskbar_center::toggle();
-    let msg = i18n::t(if enabled { "popup.taskbar_on" } else { "popup.taskbar_off" });
+    let msg = i18n::t(if enabled {
+        "popup.taskbar_on"
+    } else {
+        "popup.taskbar_off"
+    });
     println!("[*] {msg}");
     popup::show("", msg, "info");
 }
@@ -575,11 +673,19 @@ fn copy_to_clipboard(pixels: &[u8], width: u32, height: u32) {
     match cb.set_image(img) {
         Ok(()) => {
             println!("[+] Screenshot copied to clipboard ({width}x{height})");
-            popup::show("", &format!("{} ({width}x{height})", i18n::t("popup.screenshot_copied")), "info");
+            popup::show(
+                "",
+                &format!("{} ({width}x{height})", i18n::t("popup.screenshot_copied")),
+                "info",
+            );
         }
         Err(e) => {
             println!("[!] Copy error: {e}");
-            popup::show("", &format!("{}{e}", i18n::t("popup.error_prefix")), "error");
+            popup::show(
+                "",
+                &format!("{}{e}", i18n::t("popup.error_prefix")),
+                "error",
+            );
         }
     }
 }
@@ -588,12 +694,27 @@ fn copy_to_clipboard(pixels: &[u8], width: u32, height: u32) {
 // stdio redirect (GUI mode)
 // ============================================================
 
-/// Without a console, `println!` panics on Windows.
-/// Redirect stdout/stderr to NUL so writes silently succeed.
-fn redirect_stdio_to_nul() {
+/// Without a console, `println!` panics on Windows, so stdout and stderr have
+/// to go somewhere.  They go to a log file next to the settings rather than to
+/// NUL: when a capture or a hotkey misbehaves on someone else's machine, the
+/// alternative is guessing.  Truncated at every start, so it stays small.
+fn redirect_stdio_to_log() {
     use std::os::windows::io::AsRawHandle;
-    if let Ok(nul) = std::fs::File::create("NUL") {
-        let handle = nul.as_raw_handle();
+
+    let path = std::env::var("APPDATA")
+        .map(|dir| std::path::PathBuf::from(dir).join("screen-translator"))
+        .map(|dir| {
+            let _ = std::fs::create_dir_all(&dir);
+            dir.join("log.txt")
+        });
+
+    let file = path
+        .ok()
+        .and_then(|p| std::fs::File::create(p).ok())
+        .or_else(|| std::fs::File::create("NUL").ok());
+
+    if let Some(file) = file {
+        let handle = file.as_raw_handle();
         unsafe {
             unsafe extern "system" {
                 fn SetStdHandle(nStdHandle: u32, hHandle: *mut core::ffi::c_void) -> i32;
@@ -601,7 +722,7 @@ fn redirect_stdio_to_nul() {
             SetStdHandle(0xFFFF_FFF5, handle); // STD_OUTPUT_HANDLE
             SetStdHandle(0xFFFF_FFF4, handle); // STD_ERROR_HANDLE
         }
-        std::mem::forget(nul); // keep handle alive for process lifetime
+        std::mem::forget(file); // keep the handle alive for the process lifetime
     }
 }
 

@@ -22,6 +22,8 @@ const DT_EDITCONTROL: u32 = 0x2000;
 
 const CLR_COPY_ICON: u32 = 0x0080_8080;
 const CLR_COPY_HOVER: u32 = 0x00E0_E0E0;
+const CLR_COPY_PLATE: u32 = 0x003A_3A3A;
+const CLR_COPY_PLATE_BORDER: u32 = 0x0048_4848;
 const CLR_CHECK: u32 = 0x0060_D060;
 
 // ============================================================
@@ -84,7 +86,11 @@ fn store_hwnd(m: &Mutex<isize>, hwnd: HWND) {
 
 fn load_hwnd(m: &Mutex<isize>) -> Option<HWND> {
     let v = *m.lock().unwrap();
-    if v == 0 { None } else { Some(HWND(v as *mut _)) }
+    if v == 0 {
+        None
+    } else {
+        Some(HWND(v as *mut _))
+    }
 }
 
 fn hfont(m: &Mutex<isize>) -> HFONT {
@@ -92,13 +98,19 @@ fn hfont(m: &Mutex<isize>) -> HFONT {
 }
 
 fn is_loading() -> bool {
-    POPUP_TEXT.lock().unwrap().as_ref().is_some_and(|t| t.loading)
+    POPUP_TEXT
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|t| t.loading)
 }
 
 fn should_show_on_create() -> bool {
-    POPUP_TEXT.lock().unwrap().as_ref().is_some_and(|t| {
-        t.loading || !t.translated.is_empty() || !t.original.is_empty()
-    })
+    POPUP_TEXT
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|t| t.loading || !t.translated.is_empty() || !t.original.is_empty())
 }
 
 // ============================================================
@@ -203,7 +215,12 @@ unsafe fn set_alpha(hwnd: HWND, alpha: u8) {
 unsafe fn raise_topmost(hwnd: HWND) {
     unsafe {
         let _ = SetWindowPos(
-            hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+            hwnd,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         );
     }
@@ -252,10 +269,21 @@ fn measure_text(hdc: HDC, font: HFONT, text: &str, max_width: i32) -> RECT {
     unsafe {
         let old = SelectObject(hdc, font);
         let mut wide = to_wide(text);
-        if wide.last() == Some(&0) { wide.pop(); }
-        let mut rc = RECT { left: 0, top: 0, right: max_width, bottom: 0 };
-        DrawTextW(hdc, &mut wide, &mut rc,
-            DRAW_TEXT_FORMAT(DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL));
+        if wide.last() == Some(&0) {
+            wide.pop();
+        }
+        let mut rc = RECT {
+            left: 0,
+            top: 0,
+            right: max_width,
+            bottom: 0,
+        };
+        DrawTextW(
+            hdc,
+            &mut wide,
+            &mut rc,
+            DRAW_TEXT_FORMAT(DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL),
+        );
         SelectObject(hdc, old);
         rc
     }
@@ -284,17 +312,28 @@ fn calc_layout(hdc: HDC) -> Layout {
     let direction_rect = if has_original && !text.direction.is_empty() {
         let dr = measure_text(hdc, font_dir, &text.direction, text_w);
         let dir_h = (dr.bottom - dr.top).max(14);
-        let r = RECT { left: PAD_X, top: y, right: PAD_X + text_w, bottom: y + dir_h };
+        let r = RECT {
+            left: PAD_X,
+            top: y,
+            right: PAD_X + text_w,
+            bottom: y + dir_h,
+        };
         y += dir_h + 8;
         r
     } else {
         RECT::default()
     };
 
-    let text_left = if is_loading { PAD_X + SPINNER_R * 2 + 12 } else { PAD_X };
+    let text_left = if is_loading {
+        PAD_X + SPINNER_R * 2 + 12
+    } else {
+        PAD_X
+    };
     let translated_rect = RECT {
-        left: text_left, top: y,
-        right: PAD_X + text_w, bottom: y + translated_h,
+        left: text_left,
+        top: y,
+        right: PAD_X + text_w,
+        bottom: y + translated_h,
     };
 
     let copy_btn_rect = if show_copy {
@@ -317,7 +356,12 @@ fn calc_layout(hdc: HDC) -> Layout {
         y += 12;
         let or = measure_text(hdc, font_small, &text.original, MAX_W - 2 * PAD_X);
         let orig_h = (or.bottom - or.top).max(16);
-        let r = RECT { left: PAD_X, top: y, right: MAX_W - PAD_X, bottom: y + orig_h };
+        let r = RECT {
+            left: PAD_X,
+            top: y,
+            right: MAX_W - PAD_X,
+            bottom: y + orig_h,
+        };
         y += orig_h;
         (sep, r)
     } else {
@@ -328,9 +372,14 @@ fn calc_layout(hdc: HDC) -> Layout {
 
     Layout {
         total_h: y.min(MAX_POPUP_H),
-        translated_rect, separator_y, direction_rect,
-        original_rect, copy_btn_rect,
-        has_original, is_loading, show_copy,
+        translated_rect,
+        separator_y,
+        direction_rect,
+        original_rect,
+        copy_btn_rect,
+        has_original,
+        is_loading,
+        show_copy,
     }
 }
 
@@ -389,10 +438,19 @@ fn create_popup() -> Option<HWND> {
 
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
-            class, w!(""), WS_POPUP,
-            cursor.x + 15, cursor.y + 15, MAX_W, 200,
-            HWND::default(), HMENU::default(), hinstance, None,
-        ).ok()?;
+            class,
+            w!(""),
+            WS_POPUP,
+            cursor.x + 15,
+            cursor.y + 15,
+            MAX_W,
+            200,
+            HWND::default(),
+            HMENU::default(),
+            hinstance,
+            None,
+        )
+        .ok()?;
 
         let rgn = CreateRoundRectRgn(0, 0, MAX_W + 1, 201, CORNER_R, CORNER_R);
         SetWindowRgn(hwnd, rgn, true);
@@ -429,8 +487,12 @@ unsafe fn reposition_and_repaint(hwnd: HWND) {
 
         let mut x = cursor.x + 15;
         let mut y = cursor.y + 15;
-        if x + MAX_W > sw { x = cursor.x - MAX_W - 5; }
-        if y + h > sh { y = cursor.y - h - 5; }
+        if x + MAX_W > sw {
+            x = cursor.x - MAX_W - 5;
+        }
+        if y + h > sh {
+            y = cursor.y - h - 5;
+        }
         x = x.max(5);
         y = y.max(5);
 
@@ -445,9 +507,7 @@ unsafe fn reposition_and_repaint(hwnd: HWND) {
 // Window procedure
 // ============================================================
 
-unsafe extern "system" fn popup_proc(
-    hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM,
-) -> LRESULT {
+unsafe extern "system" fn popup_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         match msg {
             WM_TIMER => {
@@ -504,7 +564,10 @@ unsafe extern "system" fn popup_proc(
                 LRESULT(0)
             }
             WM_ERASEBKGND => LRESULT(1),
-            WM_CLOSE => { hide_popup(hwnd); LRESULT(0) }
+            WM_CLOSE => {
+                hide_popup(hwnd);
+                LRESULT(0)
+            }
             WM_DESTROY => {
                 kill_all_timers(hwnd);
                 *POPUP_RAW.lock().unwrap() = 0;
@@ -542,9 +605,7 @@ unsafe fn hide_popup(hwnd: HWND) {
 // Low-level mouse hook — "click outside to dismiss"
 // ============================================================
 
-unsafe extern "system" fn mouse_hook_proc(
-    code: i32, wp: WPARAM, lp: LPARAM,
-) -> LRESULT {
+unsafe extern "system" fn mouse_hook_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         if code >= 0 {
             let msg = wp.0 as u32;
@@ -555,8 +616,8 @@ unsafe extern "system" fn mouse_hook_proc(
                         let mut rc = RECT::default();
                         let _ = GetWindowRect(hwnd, &mut rc);
                         let (px, py) = (info.pt.x, info.pt.y);
-                        let inside = px >= rc.left && px < rc.right
-                                  && py >= rc.top  && py < rc.bottom;
+                        let inside =
+                            px >= rc.left && px < rc.right && py >= rc.top && py < rc.bottom;
                         if !inside {
                             // Don't call hide_popup from the hook thread —
                             // post back to the popup's thread and let the
@@ -576,12 +637,14 @@ unsafe extern "system" fn mouse_hook_proc(
 unsafe fn install_mouse_hook() {
     unsafe {
         let mut g = MOUSE_HOOK.lock().unwrap();
-        if *g != 0 { return; }
-        let Ok(hmodule) = GetModuleHandleW(None) else { return };
-        let hook = SetWindowsHookExW(
-            WH_MOUSE_LL, Some(mouse_hook_proc),
-            HINSTANCE(hmodule.0), 0,
-        ).unwrap_or_default();
+        if *g != 0 {
+            return;
+        }
+        let Ok(hmodule) = GetModuleHandleW(None) else {
+            return;
+        };
+        let hook = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), HINSTANCE(hmodule.0), 0)
+            .unwrap_or_default();
         *g = hook.0 as isize;
     }
 }
@@ -589,7 +652,9 @@ unsafe fn install_mouse_hook() {
 unsafe fn uninstall_mouse_hook() {
     unsafe {
         let mut g = MOUSE_HOOK.lock().unwrap();
-        if *g == 0 { return; }
+        if *g == 0 {
+            return;
+        }
         let _ = UnhookWindowsHookEx(HHOOK(*g as *mut _));
         *g = 0;
     }
@@ -604,7 +669,9 @@ unsafe fn paint_buffered(hwnd: HWND, hdc: HDC) {
         let mut rc = RECT::default();
         let _ = GetClientRect(hwnd, &mut rc);
         let (w, h) = (rc.right, rc.bottom);
-        if w <= 0 || h <= 0 { return; }
+        if w <= 0 || h <= 0 {
+            return;
+        }
 
         let mem_dc = CreateCompatibleDC(hdc);
         let mem_bmp = CreateCompatibleBitmap(hdc, w, h);
@@ -627,11 +694,18 @@ unsafe fn paint_content(hdc: HDC) {
     unsafe {
         let layout = calc_layout(hdc);
         let text_guard = POPUP_TEXT.lock().unwrap();
-        let Some(text) = text_guard.as_ref() else { return };
+        let Some(text) = text_guard.as_ref() else {
+            return;
+        };
 
         // Accent bar.
         let accent_brush = CreateSolidBrush(COLORREF(theme::CLR_ACCENT));
-        let accent_rc = RECT { left: 0, top: 0, right: MAX_W, bottom: ACCENT_H };
+        let accent_rc = RECT {
+            left: 0,
+            top: 0,
+            right: MAX_W,
+            bottom: ACCENT_H,
+        };
         let _ = FillRect(hdc, &accent_rc, accent_brush);
         let _ = DeleteObject(accent_brush);
 
@@ -639,14 +713,28 @@ unsafe fn paint_content(hdc: HDC) {
 
         // Direction label.
         if layout.has_original && !text.direction.is_empty() {
-            draw_text_block(hdc, &text.direction, &layout.direction_rect,
-                hfont(&FONT_DIR_RAW), theme::CLR_ACCENT);
+            draw_text_block(
+                hdc,
+                &text.direction,
+                &layout.direction_rect,
+                hfont(&FONT_DIR_RAW),
+                theme::CLR_ACCENT,
+            );
         }
 
         // Translated text.
-        let translated_clr = if layout.is_loading { theme::CLR_HINT } else { theme::CLR_TEXT_BRIGHT };
-        draw_text_block(hdc, &text.translated, &layout.translated_rect,
-            hfont(&FONT_MAIN_RAW), translated_clr);
+        let translated_clr = if layout.is_loading {
+            theme::CLR_HINT
+        } else {
+            theme::CLR_TEXT_BRIGHT
+        };
+        draw_text_block(
+            hdc,
+            &text.translated,
+            &layout.translated_rect,
+            hfont(&FONT_MAIN_RAW),
+            translated_clr,
+        );
 
         // Spinner.
         if layout.is_loading {
@@ -674,8 +762,13 @@ unsafe fn paint_content(hdc: HDC) {
             SelectObject(hdc, old_pen);
             let _ = DeleteObject(sep_pen);
 
-            draw_text_block(hdc, &text.original, &layout.original_rect,
-                hfont(&FONT_SMALL_RAW), theme::CLR_TEXT_DIM);
+            draw_text_block(
+                hdc,
+                &text.original,
+                &layout.original_rect,
+                hfont(&FONT_SMALL_RAW),
+                theme::CLR_TEXT_DIM,
+            );
         }
     }
 }
@@ -686,10 +779,16 @@ unsafe fn draw_text_block(hdc: HDC, text: &str, rect: &RECT, font: HFONT, colour
         SetTextColor(hdc, COLORREF(colour));
         let old = SelectObject(hdc, font);
         let mut wide = to_wide(text);
-        if wide.last() == Some(&0) { wide.pop(); }
+        if wide.last() == Some(&0) {
+            wide.pop();
+        }
         let mut rc = *rect;
-        DrawTextW(hdc, &mut wide, &mut rc,
-            DRAW_TEXT_FORMAT(DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL));
+        DrawTextW(
+            hdc,
+            &mut wide,
+            &mut rc,
+            DRAW_TEXT_FORMAT(DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL),
+        );
         SelectObject(hdc, old);
     }
 }
@@ -721,7 +820,17 @@ unsafe fn draw_spinner(hdc: HDC, cx: i32, cy: i32, r: i32, angle: i32) {
         let x_end = cx + (rf * start_rad.cos()) as i32;
         let y_end = cy - (rf * start_rad.sin()) as i32;
 
-        let _ = Arc(hdc, cx - r, cy - r, cx + r, cy + r, x_start, y_start, x_end, y_end);
+        let _ = Arc(
+            hdc,
+            cx - r,
+            cy - r,
+            cx + r,
+            cy + r,
+            x_start,
+            y_start,
+            x_end,
+            y_end,
+        );
 
         SelectObject(hdc, old_pen);
         SelectObject(hdc, old_brush);
@@ -731,6 +840,21 @@ unsafe fn draw_spinner(hdc: HDC, cx: i32, cy: i32, r: i32, angle: i32) {
 
 unsafe fn draw_copy_icon(hdc: HDC, rect: &RECT, hover: bool) {
     unsafe {
+        // Ghost button, the way macOS does toolbar glyphs: nothing at rest,
+        // then a soft rounded plate slides in under the pointer.
+        if hover {
+            let plate = CreateSolidBrush(COLORREF(CLR_COPY_PLATE));
+            let plate_pen = CreatePen(PS_SOLID, 1, COLORREF(CLR_COPY_PLATE_BORDER));
+            let op = SelectObject(hdc, plate_pen);
+            let ob = SelectObject(hdc, plate);
+            let r = crate::button::radius(rect.bottom - rect.top) * 2;
+            let _ = RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, r, r);
+            SelectObject(hdc, op);
+            SelectObject(hdc, ob);
+            let _ = DeleteObject(plate);
+            let _ = DeleteObject(plate_pen);
+        }
+
         let clr = if hover { CLR_COPY_HOVER } else { CLR_COPY_ICON };
         let pen = CreatePen(PS_SOLID, 1, COLORREF(clr));
         let old_pen = SelectObject(hdc, pen);
@@ -741,9 +865,15 @@ unsafe fn draw_copy_icon(hdc: HDC, rect: &RECT, hover: bool) {
 
         // Back sheet.
         let _ = Rectangle(hdc, cx - 3, cy - 5, cx + 7, cy + 5);
-        // Erase overlap for front sheet.
-        let fill = CreateSolidBrush(COLORREF(theme::CLR_BG));
-        let fr = RECT { left: cx - 7, top: cy - 6, right: cx + 4, bottom: cy + 4 };
+        // Erase overlap for front sheet — against the plate when it's there.
+        let behind = if hover { CLR_COPY_PLATE } else { theme::CLR_BG };
+        let fill = CreateSolidBrush(COLORREF(behind));
+        let fr = RECT {
+            left: cx - 7,
+            top: cy - 6,
+            right: cx + 4,
+            bottom: cy + 4,
+        };
         let _ = FillRect(hdc, &fr, fill);
         let _ = DeleteObject(fill);
         // Front sheet.

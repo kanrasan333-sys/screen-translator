@@ -737,6 +737,7 @@ dependencies = [
  "arboard",
  "base64",
  "chrono",
+ "miniz_oxide",
  "serde",
  "serde_json",
  "ureq",

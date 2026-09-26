@@ -39,3 +39,6 @@ Desktop.ini
 *.tmp
 *.bak
 *~
+
+# Corpora downloaded by tools/build_punto_dicts.py
+/tools/.cache/

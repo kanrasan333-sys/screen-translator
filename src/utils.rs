@@ -41,15 +41,6 @@ pub fn urlencode(s: &str) -> String {
 }
 
 // ============================================================
-// Unicode helpers
-// ============================================================
-
-/// Returns `true` if the character belongs to the Cyrillic Unicode block.
-pub fn is_cyrillic(c: char) -> bool {
-    matches!(c, '\u{0400}'..='\u{04FF}' | '\u{0500}'..='\u{052F}')
-}
-
-// ============================================================
 // Win32 input helpers
 // ============================================================
 

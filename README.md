@@ -60,22 +60,42 @@ system tray with a ~20 MB memory footprint.
   - **The frames decide where the seam is**, either way: each new frame is
     matched against the last to measure how far the content really moved, so
     sticky headers, footers and the scrollbar don't throw the alignment off.
-- **Punto-style layout correction** — manually rewrite the last typed word
-  from the wrong keyboard layout into the right one, or let the automatic
-  mode detect and fix gibberish in real time as you type, usually within
-  three or four keystrokes rather than at the end of the word.
-  - **Three languages.** English, Russian and Ukrainian, each with its own
-    word list. The same keystrokes have two Cyrillic readings — `s` is `ы`
-    in Russian but `і` in Ukrainian — so both are tested and the dictionaries
-    decide: `ghbdtn` → `привет`, `ghbdsn` → `привіт`. Ukrainian typed on a
-    Russian layout is fixed too (`привыт` → `привіт`), as is Latin typed on a
-    Ukrainian one. Ties go to whichever Cyrillic layout you actually use.
-  - **Backspace undoes it.** Pressing Backspace immediately after a correction
-    restores exactly what you typed, puts your layout back, and blacklists
-    that word for the rest of the session, so it stops arguing with you.
-  - **Punctuation is applied after the fix, not before.** The key that ends
-    the word is held back until the correction lands — so `Enter` sends an
-    already-corrected message instead of a corrected one being sent too late.
+- **Punto-style layout correction** — words typed on the wrong keyboard layout
+  are retyped on the right one as you type, and the layout is switched so the
+  rest comes out right; clear cases are fixed within four or five keystrokes,
+  the rest when the word ends.
+  - **Real dictionaries.** A quarter of a million word *forms* per language
+    (English, Russian, Ukrainian), ranked by frequency from subtitles and
+    Wikipedia, plus a character model for words no list holds. Every word is
+    judged by how likely each layout's reading of the same keys is, and what
+    you typed gets a head start sized by how much it looks meant: a common
+    word (`руку`, `tv`) is never rewritten into another one (`here`, `ем`), a
+    typo stays a typo in its own language (`кучча`), and layout noise
+    (`ghbdtn`, `руддщ`) loses to any real word.
+  - **Russian and Ukrainian told apart by the word.** `ghbdtn` → `привет`,
+    `ghbdsn` → `привіт`; Ukrainian typed on the Russian layout is fixed
+    (`привыт` → `привіт`), and so is Russian on the Ukrainian one (`єто` →
+    `это`). Spellings both languages share follow the language you have been
+    writing in, and a correct word on the wrong Cyrillic layout (`купувати` on
+    the Russian one) just has the layout switched under it.
+  - **Whole words, punctuation included.** `,` `.` `;` `'` `[` `]` are
+    letters on the Cyrillic layouts (`б ю ж э х ъ`), so `,jkmibvb` becomes
+    `большими`, not `,ольшими`. Punctuation after a word is retyped as the
+    target layout has it: `ghbdtn/` becomes `привет.`, `руддщб` becomes `hello,`.
+  - **Short words follow the sentence.** Alone, `z`, `,s` or `ye` could be
+    anything; once the next word settles which layout you thought you were on,
+    they are fixed along with it: `z ,s gjikf` → `я бы пошла`, `ye lf` → `ну да`.
+  - **`Pause` takes a correction back** — restores what you typed, switches
+    your layout back and remembers the word (`punto_exceptions.txt` next to
+    the settings, one word per line, editable). On a word nobody touched it
+    converts it instead, and pressing it again goes back. `Ctrl+Alt+L` does the
+    same for the word just typed, or converts the selection when there is one.
+    Backspace is just Backspace.
+  - **Enter and Tab act after the fix.** The key that ends the word is held
+    back until the correction lands, so `Enter` sends the corrected message.
+  - **Any installed layout variant** — read from Windows itself, so "Russian
+    (Ukraine)", Ukrainian (Enhanced) with `ґ` on its own key, or a UK English
+    board all work. Classic password boxes are left alone.
 - **Ask the model** — `Ctrl+Tab` drops a single input line in the middle of the
   screen. Type, press Enter, and the answer unfolds underneath while the input
   stays where it was; the window height follows the reply, so a one-word answer
@@ -110,7 +130,9 @@ system tray with a ~20 MB memory footprint.
 | `Ctrl+Alt+T` | Translate the currently selected text |
 | `Ctrl+Alt+S` | Select a region → OCR → translate |
 | `Ctrl+Alt+D` | Screenshot a region to the clipboard |
-| `Ctrl+Alt+L` | Fix the keyboard layout of the last typed word |
+| `Ctrl+Alt+L` | Switch the layout of the word just typed, or of the selection |
+| `Pause` | Take back the last automatic correction (or convert the last word) |
+| `Ctrl+Alt+A` | Turn automatic layout correction on or off |
 | `Ctrl+Tab` | Ask the model a question |
 
 Inside the capture overlay, once a region is selected:
@@ -217,8 +239,13 @@ src/
 ├── settings_ui.rs     # custom owner-drawn dark settings window
 ├── tray.rs            # system tray icon (Shell_NotifyIcon)
 ├── autostart.rs       # Windows Registry Run key for autostart
-├── autotype.rs        # automatic Punto-style layout correction
-├── layout.rs          # RU ↔ EN keyboard layout maps for Punto
+├── autotype/          # Punto-style layout correction
+│   ├── mod.rs         #   keyboard/mouse hooks on their own thread, SendInput
+│   ├── engine.rs      #   keystrokes in, corrections out (no Win32; simulated in tests)
+│   ├── decide.rs      #   which layout a word was meant for
+│   ├── model.rs       #   dictionaries and character trigram models
+│   ├── keymap.rs      #   what each key types on each installed layout
+│   └── eval.rs        #   accuracy measurement on held-out word lists
 ├── taskbar_center.rs  # taskbar icon centering
 ├── capture.rs         # rectangular screen-region selector overlay
 ├── scroll_capture.rs  # scrolling "full page" capture and frame stitching
@@ -234,6 +261,9 @@ src/
 ├── button.rs          # macOS-style push buttons
 ├── theme.rs           # macOS dark-appearance colour palette
 └── utils.rs           # UTF-16, urlencode, Win32 input helpers
+
+data/punto/            # word models, built by tools/build_punto_dicts.py
+tools/                 # the dictionary builder (downloads its corpora)
 ```
 
 ---

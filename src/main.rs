@@ -8,7 +8,6 @@ mod capture;
 mod deepseek;
 mod explorer_cmd;
 mod i18n;
-mod layout;
 mod ocr;
 mod paint;
 mod popup;
@@ -132,6 +131,7 @@ fn main() {
     popup::init();
     tray::create();
     let hotkey_failures = register_hotkeys(&s);
+    autotype::set_hotkey(s.hk_layout.modifiers, s.hk_layout.vk);
     if s.punto_enabled {
         autotype::start();
     }
@@ -179,6 +179,7 @@ fn run_main_loop() {
                 let hotkey_failures = register_hotkeys(&new);
 
                 // Punto Switcher
+                autotype::set_hotkey(new.hk_layout.modifiers, new.hk_layout.vk);
                 if new.punto_enabled && !autotype::is_enabled() {
                     autotype::start();
                 } else if !new.punto_enabled && autotype::is_enabled() {
@@ -599,28 +600,47 @@ fn pick_png_save_path(initial_folder: Option<String>) -> anyhow::Result<Option<S
     .map_err(|_| anyhow::anyhow!("Save dialog thread panicked"))?
 }
 
+/// The layout hotkey. Right after typing it acts on the word just typed:
+/// takes back the correction the switcher made, or converts the word itself.
+/// Otherwise it converts the selection — into whichever language its words
+/// turn out to be in, Ukrainian included — and switches the layout to match.
 fn handle_layout_switch() {
+    if autotype::convert_last_word() {
+        return;
+    }
     println!("[*] Switching layout of selected text...");
+    let before = unsafe { GetClipboardSequenceNumber() };
     simulate_copy();
-    thread::sleep(Duration::from_millis(250));
-
-    let text = match clipboard_text() {
-        Some(t) => t,
-        None => return,
+    // Nothing selected means nothing copied, and the clipboard still holds
+    // whatever it held before: converting that would paste something the
+    // user never pointed at.
+    let Some(text) = await_copy(before, Instant::now() + SELECTION_LATE_WAIT) else {
+        println!("[!] Nothing selected");
+        return;
     };
-
-    let converted = layout::convert(&text);
+    let Some((converted, hkl)) = autotype::convert_text(&text) else {
+        println!("[!] Nothing to convert");
+        return;
+    };
     println!(
         "[+] {} -> {}",
         utils::truncate(&text, 40),
         utils::truncate(&converted, 40)
     );
 
-    if let Ok(mut cb) = arboard::Clipboard::new() {
-        let _ = cb.set_text(&converted);
+    // Typed over the selection, which leaves the clipboard alone. Several
+    // lines go through the clipboard instead: a typed newline or tab means
+    // different things to different applications.
+    if converted.contains(['\n', '\r', '\t']) || converted.chars().count() > 2000 {
+        if let Ok(mut cb) = arboard::Clipboard::new() {
+            let _ = cb.set_text(&converted);
+        }
+        thread::sleep(Duration::from_millis(50));
+        simulate_paste();
+    } else {
+        autotype::type_text(&converted);
     }
-    thread::sleep(Duration::from_millis(50));
-    simulate_paste();
+    autotype::switch_layout(hkl);
 }
 
 fn handle_settings() {

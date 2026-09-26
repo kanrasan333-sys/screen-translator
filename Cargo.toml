@@ -34,3 +34,4 @@ anyhow = "1"
 chrono = "0.4"
 base64 = "0.22"
 ureq = { version = "2", features = ["json"] }
+miniz_oxide = "0.8"

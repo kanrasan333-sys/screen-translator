@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "__MSG_extName__",
+  "description": "__MSG_extDescription__",
+  "version": "1.1.0",
+  "default_locale": "en",
+  "minimum_chrome_version": "116",
+  "permissions": ["contextMenus", "debugger", "downloads", "offscreen", "scripting"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "__MSG_actionFullPage__"
+  },
+  "commands": {
+    "full-page": {
+      "suggested_key": { "default": "Ctrl+Shift+S" },
+      "description": "__MSG_actionFullPage__"
+    }
+  }
+}

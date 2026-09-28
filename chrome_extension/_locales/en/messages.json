@@ -1,0 +1,11 @@
+{
+  "extName": {"message": "Full-page screenshot · Save image as PNG / JPG / WebP"},
+  "extDescription": {"message": "Whole-page screenshot without scrolling. Right-click an image to save it as PNG, JPG or WebP, whatever the site served."},
+  "actionFullPage": {"message": "Screenshot the whole page"},
+  "menuParent": {"message": "Save image as"},
+  "errFetch": {"message": "Couldn't download the image ($1)."},
+  "errDecode": {"message": "The browser couldn't read this image."},
+  "errEncode": {"message": "Couldn't convert the image ($1)."},
+  "errDownload": {"message": "Couldn't save the image ($1)."},
+  "errCapture": {"message": "Couldn't capture the page ($1)."}
+}

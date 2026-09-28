@@ -92,7 +92,13 @@ pub fn destroy() {
 
 unsafe fn add_icon(hwnd: HWND) {
     unsafe {
-        let icon = LoadIconW(None, IDI_APPLICATION).unwrap_or_default();
+        // The app mark, drawn at the size the tray actually shows — a
+        // stretched 32 px icon goes soft at 16.
+        let size = GetSystemMetrics(SM_CXSMICON);
+        let mut icon = crate::theme::app_icon(size);
+        if icon.is_invalid() {
+            icon = LoadIconW(None, IDI_APPLICATION).unwrap_or_default();
+        }
 
         let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
         nid.cbSize = size_of::<NOTIFYICONDATAW>() as u32;

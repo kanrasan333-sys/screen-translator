@@ -1,65 +1,69 @@
+//! The floating card that shows a translation, a status message or an error.
+//!
+//! It never takes focus and dismisses itself: after a few seconds, or on any
+//! click outside it.  The card is a per-pixel-alpha layered window
+//! (`paint::present_card`), which is what buys it smooth corners and a soft
+//! shadow — so there is no `WM_PAINT` path: every change of content, hover or
+//! fade re-renders the card and hands it to `UpdateLayeredWindow`.
+
+use crate::paint;
 use crate::theme;
-use crate::utils::{lparam_to_point, to_wide};
+use crate::utils::lparam_to_point;
 use std::sync::Mutex;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::w;
-
-// ============================================================
-// Draw-text format flags (missing from the windows crate)
-// ============================================================
-
-const DT_WORDBREAK: u32 = 0x0010;
-const DT_CALCRECT: u32 = 0x0400;
-const DT_NOPREFIX: u32 = 0x0800;
-const DT_EDITCONTROL: u32 = 0x2000;
-
-// ============================================================
-// Popup-specific colours (not shared via theme)
-// ============================================================
-
-const CLR_COPY_ICON: u32 = 0x0080_8080;
-const CLR_COPY_HOVER: u32 = 0x00E0_E0E0;
-const CLR_COPY_PLATE: u32 = 0x003A_3A3A;
-const CLR_COPY_PLATE_BORDER: u32 = 0x0048_4848;
-const CLR_CHECK: u32 = 0x0060_D060;
 
 // ============================================================
 // Geometry / timing constants
 // ============================================================
 
-const MAX_W: i32 = 440;
+const CARD_W: i32 = 440;
 const PAD_X: i32 = 18;
-const PAD_Y: i32 = 14;
-const ACCENT_H: i32 = 4;
+const PAD_Y: i32 = 16;
 const CORNER_R: i32 = 12;
+/// The language-pair chip and the copy button share a header row.
+const HEADER_H: i32 = 24;
+const HEADER_GAP: i32 = 10;
+/// Status messages carry an icon to the left of the text.
+const ICON_W: i32 = 26;
+const COPY_BTN_W: i32 = 30;
+const COPY_BTN_H: i32 = 26;
+const MAX_CARD_H: i32 = 500;
+
+const FONT_MAIN: i32 = 16;
+const FONT_SMALL: i32 = 13;
+const FONT_CHIP: i32 = 11;
 
 const TIMER_FADEIN: usize = 100;
 const TIMER_SPINNER: usize = 101;
 const TIMER_AUTOHIDE: usize = 102;
 const TIMER_COPY_RESET: usize = 103;
-const FADE_STEP: u8 = 30;
+const FADE_STEP: u8 = 36;
 const FADE_INTERVAL_MS: u32 = 12;
-const SPINNER_INTERVAL_MS: u32 = 40;
+const SPINNER_INTERVAL_MS: u32 = 30;
 const AUTOHIDE_MS: u32 = 8000;
-const SPINNER_R: i32 = 10;
-const COPY_BTN_SIZE: i32 = 26;
-const MAX_POPUP_H: i32 = 500;
+const SPINNER_R: i32 = 8;
+/// Fully opaque: a translucent card over busy content is harder to read, and
+/// the soft shadow already lifts it off the page.
+const OPAQUE: u8 = 255;
+
+const WM_MOUSELEAVE: u32 = 0x02A3;
 
 // ============================================================
-// Global state (HWND / HFONT stored as raw isize for Send)
+// Global state (HWND stored as raw isize for Send)
 // ============================================================
 
 static POPUP_RAW: Mutex<isize> = Mutex::new(0);
-static FONT_MAIN_RAW: Mutex<isize> = Mutex::new(0);
-static FONT_SMALL_RAW: Mutex<isize> = Mutex::new(0);
-static FONT_DIR_RAW: Mutex<isize> = Mutex::new(0);
 static CURRENT_ALPHA: Mutex<u8> = Mutex::new(0);
 static SPINNER_ANGLE: Mutex<i32> = Mutex::new(0);
 static COPY_HOVER: Mutex<bool> = Mutex::new(false);
 static COPY_DONE: Mutex<bool> = Mutex::new(false);
+/// Where the card's top-left sits on screen.
+static CARD_POS: Mutex<(i32, i32)> = Mutex::new((0, 0));
 
 /// Global low-level mouse hook installed while the popup is visible, so a
 /// click anywhere outside the popup dismisses it.  SetCapture is fragile
@@ -76,25 +80,13 @@ struct PopupText {
 }
 static POPUP_TEXT: Mutex<Option<PopupText>> = Mutex::new(None);
 
-// ============================================================
-// Handle helpers (HWND / HFONT ↔ isize)
-// ============================================================
-
 fn store_hwnd(m: &Mutex<isize>, hwnd: HWND) {
     *m.lock().unwrap() = hwnd.0 as isize;
 }
 
 fn load_hwnd(m: &Mutex<isize>) -> Option<HWND> {
     let v = *m.lock().unwrap();
-    if v == 0 {
-        None
-    } else {
-        Some(HWND(v as *mut _))
-    }
-}
-
-fn hfont(m: &Mutex<isize>) -> HFONT {
-    HFONT(*m.lock().unwrap() as *mut _)
+    (v != 0).then_some(HWND(v as *mut _))
 }
 
 fn is_loading() -> bool {
@@ -143,7 +135,7 @@ pub fn show_loading(msg: &str) {
         if let Some(hwnd) = load_hwnd(&POPUP_RAW) {
             if IsWindow(hwnd).as_bool() {
                 kill_all_timers(hwnd);
-                set_alpha(hwnd, 245);
+                *CURRENT_ALPHA.lock().unwrap() = OPAQUE;
                 reposition_and_repaint(hwnd);
                 let _ = SetTimer(hwnd, TIMER_SPINNER, SPINNER_INTERVAL_MS, None);
                 raise_topmost(hwnd);
@@ -169,11 +161,14 @@ pub fn show(original: &str, translated: &str, direction: &str) {
         if let Some(hwnd) = load_hwnd(&POPUP_RAW) {
             if IsWindow(hwnd).as_bool() {
                 kill_all_timers(hwnd);
-                reposition_and_repaint(hwnd);
                 if was_loading {
-                    set_alpha(hwnd, 245); // smooth transition from loading
+                    // Smooth hand-over from the loading card: no fade.
+                    *CURRENT_ALPHA.lock().unwrap() = OPAQUE;
+                    reposition_and_repaint(hwnd);
                 } else {
-                    start_fadein(hwnd);
+                    *CURRENT_ALPHA.lock().unwrap() = 0;
+                    reposition_and_repaint(hwnd);
+                    let _ = SetTimer(hwnd, TIMER_FADEIN, FADE_INTERVAL_MS, None);
                 }
                 let _ = SetTimer(hwnd, TIMER_AUTOHIDE, AUTOHIDE_MS, None);
                 raise_topmost(hwnd);
@@ -202,13 +197,6 @@ fn set_popup_text(translated: &str, original: &str, direction: &str, loading: bo
     });
 }
 
-unsafe fn set_alpha(hwnd: HWND, alpha: u8) {
-    unsafe {
-        *CURRENT_ALPHA.lock().unwrap() = alpha;
-        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA);
-    }
-}
-
 /// Re-asserts HWND_TOPMOST so we stay above any other topmost window
 /// that became active after us (e.g. IME candidate windows, other
 /// utilities, OSD overlays).
@@ -226,24 +214,15 @@ unsafe fn raise_topmost(hwnd: HWND) {
     }
 }
 
-// ============================================================
-// Fade-in animation
-// ============================================================
-
-unsafe fn start_fadein(hwnd: HWND) {
-    unsafe {
-        set_alpha(hwnd, 0);
-        let _ = SetTimer(hwnd, TIMER_FADEIN, FADE_INTERVAL_MS, None);
-    }
-}
-
 unsafe fn tick_fadein(hwnd: HWND) {
     unsafe {
-        let mut a = CURRENT_ALPHA.lock().unwrap();
-        let new_a = (*a as u16 + FADE_STEP as u16).min(245) as u8;
-        *a = new_a;
-        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), new_a, LWA_ALPHA);
-        if new_a >= 245 {
+        let new_a = {
+            let mut a = CURRENT_ALPHA.lock().unwrap();
+            *a = (*a as u16 + FADE_STEP as u16).min(OPAQUE as u16) as u8;
+            *a
+        };
+        present(hwnd);
+        if new_a == OPAQUE {
             let _ = KillTimer(hwnd, TIMER_FADEIN);
         }
     }
@@ -253,116 +232,170 @@ unsafe fn tick_fadein(hwnd: HWND) {
 // Layout calculation
 // ============================================================
 
-struct Layout {
-    total_h: i32,
-    translated_rect: RECT,
-    separator_y: i32,
-    direction_rect: RECT,
-    original_rect: RECT,
-    copy_btn_rect: RECT,
-    has_original: bool,
-    is_loading: bool,
-    show_copy: bool,
+/// What kind of message the card is carrying — it decides the header and
+/// the icon.  `direction` is "en -> ru" for a translation, or one of the
+/// markers the callers use for everything else.
+#[derive(Clone, PartialEq)]
+enum Kind {
+    Loading,
+    Translation(String),
+    Info,
+    Error,
+    Plain,
 }
 
-fn measure_text(hdc: HDC, font: HFONT, text: &str, max_width: i32) -> RECT {
-    unsafe {
-        let old = SelectObject(hdc, font);
-        let mut wide = to_wide(text);
-        if wide.last() == Some(&0) {
-            wide.pop();
-        }
-        let mut rc = RECT {
-            left: 0,
-            top: 0,
-            right: max_width,
-            bottom: 0,
-        };
-        DrawTextW(
-            hdc,
-            &mut wide,
-            &mut rc,
-            DRAW_TEXT_FORMAT(DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL),
-        );
-        SelectObject(hdc, old);
-        rc
+fn kind_of(t: &PopupText) -> Kind {
+    if t.loading {
+        return Kind::Loading;
     }
+    match t.direction.as_str() {
+        "error" => Kind::Error,
+        "info" => Kind::Info,
+        d if d.contains("->") => {
+            let pair = d
+                .split("->")
+                .map(|s| s.trim().to_uppercase())
+                .collect::<Vec<_>>()
+                .join(" \u{2192} ");
+            Kind::Translation(pair)
+        }
+        _ => Kind::Plain,
+    }
+}
+
+struct Layout {
+    total_h: i32,
+    kind: Kind,
+    /// Header row — only a translation has one.
+    chip_rect: RECT,
+    copy_btn_rect: RECT,
+    icon_rect: RECT,
+    text_rect: RECT,
+    separator_y: i32,
+    original_rect: RECT,
+    has_original: bool,
+    show_copy: bool,
 }
 
 fn calc_layout(hdc: HDC) -> Layout {
     let guard = POPUP_TEXT.lock().unwrap();
     let text = guard.as_ref().unwrap();
+    let kind = kind_of(text);
+    let main_font = theme::ui_font(FONT_MAIN, 500);
+    let small_font = theme::ui_font(FONT_SMALL, 400);
 
-    let has_original = !text.original.is_empty();
-    let is_loading = text.loading;
-    let show_copy = !is_loading && !text.translated.is_empty();
+    let has_original = !text.original.is_empty() && kind != Kind::Loading;
+    let show_copy = kind != Kind::Loading && !text.translated.is_empty();
+    let inner_w = CARD_W - 2 * PAD_X;
 
-    let copy_margin = if show_copy { COPY_BTN_SIZE + 8 } else { 0 };
-    let text_w = MAX_W - 2 * PAD_X - copy_margin;
+    let mut y = PAD_Y;
+    let mut chip_rect = RECT::default();
+    let mut copy_btn_rect = RECT::default();
+    let mut icon_rect = RECT::default();
 
-    let font_main = hfont(&FONT_MAIN_RAW);
-    let font_small = hfont(&FONT_SMALL_RAW);
-    let font_dir = hfont(&FONT_DIR_RAW);
-
-    let tr = measure_text(hdc, font_main, &text.translated, text_w);
-    let translated_h = (tr.bottom - tr.top).max(22);
-
-    let mut y = ACCENT_H + PAD_Y;
-
-    let direction_rect = if has_original && !text.direction.is_empty() {
-        let dr = measure_text(hdc, font_dir, &text.direction, text_w);
-        let dir_h = (dr.bottom - dr.top).max(14);
-        let r = RECT {
-            left: PAD_X,
-            top: y,
-            right: PAD_X + text_w,
-            bottom: y + dir_h,
-        };
-        y += dir_h + 8;
-        r
-    } else {
-        RECT::default()
-    };
-
-    let text_left = if is_loading {
-        PAD_X + SPINNER_R * 2 + 12
-    } else {
-        PAD_X
-    };
-    let translated_rect = RECT {
-        left: text_left,
-        top: y,
-        right: PAD_X + text_w,
-        bottom: y + translated_h,
-    };
-
-    let copy_btn_rect = if show_copy {
-        let btn_y = (y + (translated_h - COPY_BTN_SIZE) / 2).max(ACCENT_H + 4);
-        RECT {
-            left: MAX_W - PAD_X - COPY_BTN_SIZE,
-            top: btn_y,
-            right: MAX_W - PAD_X,
-            bottom: btn_y + COPY_BTN_SIZE,
+    let text_rect = match &kind {
+        Kind::Loading => {
+            let h = 22;
+            icon_rect = RECT {
+                left: PAD_X,
+                top: y,
+                right: PAD_X + ICON_W - 4,
+                bottom: y + h,
+            };
+            let r = RECT {
+                left: PAD_X + ICON_W + 2,
+                top: y,
+                right: CARD_W - PAD_X,
+                bottom: y + h,
+            };
+            y += h;
+            r
         }
-    } else {
-        RECT::default()
+        Kind::Translation(pair) => {
+            // Chip on the left, copy on the right, then the text full-width.
+            let chip_font = theme::ui_font(FONT_CHIP, 700);
+            let (cw, _) = unsafe { theme::measure(hdc, pair, chip_font) };
+            chip_rect = RECT {
+                left: PAD_X,
+                top: y + 2,
+                right: PAD_X + cw + 16,
+                bottom: y + HEADER_H - 2,
+            };
+            if show_copy {
+                copy_btn_rect = RECT {
+                    left: CARD_W - PAD_X - COPY_BTN_W + 6,
+                    top: y + (HEADER_H - COPY_BTN_H) / 2,
+                    right: CARD_W - PAD_X + 6,
+                    bottom: y + (HEADER_H - COPY_BTN_H) / 2 + COPY_BTN_H,
+                };
+            }
+            y += HEADER_H + HEADER_GAP;
+            let h = unsafe { theme::measure_wrapped(hdc, &text.translated, main_font, inner_w) }
+                .max(20);
+            let r = RECT {
+                left: PAD_X,
+                top: y,
+                right: CARD_W - PAD_X,
+                bottom: y + h,
+            };
+            y += h;
+            r
+        }
+        Kind::Info | Kind::Error | Kind::Plain => {
+            // Icon on the left, copy on the right, text between.
+            let left = if kind == Kind::Plain {
+                PAD_X
+            } else {
+                PAD_X + ICON_W
+            };
+            let right = if show_copy {
+                CARD_W - PAD_X - COPY_BTN_W - 4
+            } else {
+                CARD_W - PAD_X
+            };
+            let h = unsafe {
+                theme::measure_wrapped(hdc, &text.translated, main_font, right - left)
+            }
+            .max(22);
+            if kind != Kind::Plain {
+                icon_rect = RECT {
+                    left: PAD_X - 2,
+                    top: y,
+                    right: PAD_X + ICON_W - 6,
+                    bottom: y + 22,
+                };
+            }
+            if show_copy {
+                copy_btn_rect = RECT {
+                    left: CARD_W - PAD_X - COPY_BTN_W + 6,
+                    top: y - 2,
+                    right: CARD_W - PAD_X + 6,
+                    bottom: y - 2 + COPY_BTN_H,
+                };
+            }
+            let r = RECT {
+                left,
+                top: y,
+                right,
+                bottom: y + h,
+            };
+            y += h;
+            r
+        }
     };
-
-    y += translated_h;
 
     let (separator_y, original_rect) = if has_original {
         y += 12;
         let sep = y;
         y += 12;
-        let or = measure_text(hdc, font_small, &text.original, MAX_W - 2 * PAD_X);
-        let orig_h = (or.bottom - or.top).max(16);
+        let h = unsafe { theme::measure_wrapped(hdc, &text.original, small_font, inner_w) }.max(16);
         let r = RECT {
             left: PAD_X,
             top: y,
-            right: MAX_W - PAD_X,
-            bottom: y + orig_h,
+            right: CARD_W - PAD_X,
+            bottom: y + h,
         };
-        y += orig_h;
+        y += h;
         (sep, r)
     } else {
         (0, RECT::default())
@@ -371,15 +404,25 @@ fn calc_layout(hdc: HDC) -> Layout {
     y += PAD_Y;
 
     Layout {
-        total_h: y.min(MAX_POPUP_H),
-        translated_rect,
-        separator_y,
-        direction_rect,
-        original_rect,
+        total_h: y.min(MAX_CARD_H),
+        kind,
+        chip_rect,
         copy_btn_rect,
+        icon_rect,
+        text_rect,
+        separator_y,
+        original_rect,
         has_original,
-        is_loading,
         show_copy,
+    }
+}
+
+unsafe fn layout_now(hwnd: HWND) -> Layout {
+    unsafe {
+        let hdc = GetDC(hwnd);
+        let layout = calc_layout(hdc);
+        ReleaseDC(hwnd, hdc);
+        layout
     }
 }
 
@@ -398,7 +441,7 @@ fn copy_translated(hwnd: HWND) {
             }
             *COPY_DONE.lock().unwrap() = true;
             unsafe {
-                let _ = InvalidateRect(hwnd, None, false);
+                present(hwnd);
                 let _ = SetTimer(hwnd, TIMER_COPY_RESET, 1500, None);
             }
         }
@@ -413,10 +456,10 @@ fn create_popup() -> Option<HWND> {
     unsafe {
         let hmodule = GetModuleHandleW(None).ok()?;
         let hinstance = HINSTANCE(hmodule.0);
-        let class = w!("ScrTransPopup6");
+        let class = w!("ScrTransPopup7");
 
         let wc = WNDCLASSW {
-            style: CS_DROPSHADOW | CS_HREDRAW | CS_VREDRAW,
+            style: CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(popup_proc),
             hInstance: hinstance,
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
@@ -426,24 +469,14 @@ fn create_popup() -> Option<HWND> {
         };
         RegisterClassW(&wc);
 
-        *FONT_MAIN_RAW.lock().unwrap() =
-            CreateFontW(-18, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, w!("Segoe UI")).0 as isize;
-        *FONT_SMALL_RAW.lock().unwrap() =
-            CreateFontW(-13, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, w!("Segoe UI")).0 as isize;
-        *FONT_DIR_RAW.lock().unwrap() =
-            CreateFontW(-11, 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 5, 0, w!("Segoe UI")).0 as isize;
-
-        let mut cursor = POINT::default();
-        let _ = GetCursorPos(&mut cursor);
-
         let hwnd = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE,
             class,
             w!(""),
             WS_POPUP,
-            cursor.x + 15,
-            cursor.y + 15,
-            MAX_W,
+            0,
+            0,
+            CARD_W,
             200,
             HWND::default(),
             HMENU::default(),
@@ -452,18 +485,17 @@ fn create_popup() -> Option<HWND> {
         )
         .ok()?;
 
-        let rgn = CreateRoundRectRgn(0, 0, MAX_W + 1, 201, CORNER_R, CORNER_R);
-        SetWindowRgn(hwnd, rgn, true);
-        reposition_and_repaint(hwnd);
-
         if !should_show_on_create() {
             let _ = ShowWindow(hwnd, SW_HIDE);
         } else if is_loading() {
-            set_alpha(hwnd, 245);
+            *CURRENT_ALPHA.lock().unwrap() = OPAQUE;
+            reposition_and_repaint(hwnd);
             raise_topmost(hwnd);
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         } else {
-            start_fadein(hwnd);
+            *CURRENT_ALPHA.lock().unwrap() = 0;
+            reposition_and_repaint(hwnd);
+            let _ = SetTimer(hwnd, TIMER_FADEIN, FADE_INTERVAL_MS, None);
             let _ = SetTimer(hwnd, TIMER_AUTOHIDE, AUTOHIDE_MS, None);
             raise_topmost(hwnd);
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
@@ -473,34 +505,67 @@ fn create_popup() -> Option<HWND> {
     }
 }
 
+/// Places the card next to the pointer — below and to the right, flipped to
+/// whichever side has room on the monitor the pointer is on — and renders it.
 unsafe fn reposition_and_repaint(hwnd: HWND) {
     unsafe {
-        let hdc = GetDC(hwnd);
-        let layout = calc_layout(hdc);
-        ReleaseDC(hwnd, hdc);
-        let h = layout.total_h;
+        let h = layout_now(hwnd).total_h;
 
         let mut cursor = POINT::default();
         let _ = GetCursorPos(&mut cursor);
-        let sw = GetSystemMetrics(SM_CXSCREEN);
-        let sh = GetSystemMetrics(SM_CYSCREEN);
+        let mon = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let work = if GetMonitorInfoW(mon, &mut mi).as_bool() {
+            mi.rcWork
+        } else {
+            RECT {
+                left: 0,
+                top: 0,
+                right: GetSystemMetrics(SM_CXSCREEN),
+                bottom: GetSystemMetrics(SM_CYSCREEN),
+            }
+        };
 
-        let mut x = cursor.x + 15;
-        let mut y = cursor.y + 15;
-        if x + MAX_W > sw {
-            x = cursor.x - MAX_W - 5;
+        let mut x = cursor.x + 16;
+        let mut y = cursor.y + 18;
+        if x + CARD_W > work.right - 8 {
+            x = cursor.x - CARD_W - 8;
         }
-        if y + h > sh {
-            y = cursor.y - h - 5;
+        if y + h > work.bottom - 8 {
+            y = cursor.y - h - 10;
         }
-        x = x.max(5);
-        y = y.max(5);
+        x = x.max(work.left + 8);
+        y = y.max(work.top + 8);
 
-        let rgn = CreateRoundRectRgn(0, 0, MAX_W + 1, h + 1, CORNER_R, CORNER_R);
-        SetWindowRgn(hwnd, rgn, true);
-        let _ = MoveWindow(hwnd, x, y, MAX_W, h, true);
-        let _ = InvalidateRect(hwnd, None, false);
+        *CARD_POS.lock().unwrap() = (x, y);
+        present(hwnd);
     }
+}
+
+/// Renders the card as it currently stands and puts it on screen.
+unsafe fn present(hwnd: HWND) {
+    unsafe {
+        let layout = layout_now(hwnd);
+        let (x, y) = *CARD_POS.lock().unwrap();
+        let alpha = *CURRENT_ALPHA.lock().unwrap();
+        let card = paint::Card {
+            w: CARD_W,
+            h: layout.total_h,
+            radius: CORNER_R,
+            fill: theme::CLR_ELEVATED,
+            border: theme::CLR_SEPARATOR,
+        };
+        paint::present_card(hwnd, x, y, &card, alpha, |dc| paint_content(dc, &layout));
+    }
+}
+
+/// A point in window coordinates, moved into the card's own.
+fn to_card(lp: LPARAM) -> (i32, i32) {
+    let (x, y) = lparam_to_point(lp);
+    (x - paint::CARD_MARGIN, y - paint::CARD_MARGIN)
 }
 
 // ============================================================
@@ -514,27 +579,28 @@ unsafe extern "system" fn popup_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
                 match wp.0 {
                     TIMER_FADEIN => tick_fadein(hwnd),
                     TIMER_SPINNER => {
-                        let mut angle = SPINNER_ANGLE.lock().unwrap();
-                        *angle = (*angle + 25) % 360;
-                        drop(angle);
-                        let _ = InvalidateRect(hwnd, None, false);
+                        {
+                            let mut angle = SPINNER_ANGLE.lock().unwrap();
+                            *angle = (*angle + 18) % 360;
+                        }
+                        present(hwnd);
                     }
                     TIMER_AUTOHIDE => hide_popup(hwnd),
                     TIMER_COPY_RESET => {
                         let _ = KillTimer(hwnd, TIMER_COPY_RESET);
                         *COPY_DONE.lock().unwrap() = false;
-                        let _ = InvalidateRect(hwnd, None, false);
+                        present(hwnd);
                     }
                     _ => {}
                 }
                 LRESULT(0)
             }
+            // A card never takes focus from the window being read.
+            WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
             WM_LBUTTONDOWN => {
                 if !is_loading() {
-                    let (x, y) = lparam_to_point(lp);
-                    let hdc = GetDC(hwnd);
-                    let layout = calc_layout(hdc);
-                    ReleaseDC(hwnd, hdc);
+                    let (x, y) = to_card(lp);
+                    let layout = layout_now(hwnd);
                     if layout.show_copy && point_in_rect(x, y, &layout.copy_btn_rect) {
                         copy_translated(hwnd);
                     }
@@ -543,23 +609,36 @@ unsafe extern "system" fn popup_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             }
             WM_MOUSEMOVE => {
                 if !is_loading() {
-                    let (x, y) = lparam_to_point(lp);
-                    let hdc = GetDC(hwnd);
-                    let layout = calc_layout(hdc);
-                    ReleaseDC(hwnd, hdc);
+                    let (x, y) = to_card(lp);
+                    let layout = layout_now(hwnd);
                     let hover = layout.show_copy && point_in_rect(x, y, &layout.copy_btn_rect);
-                    let old = *COPY_HOVER.lock().unwrap();
+                    let old = std::mem::replace(&mut *COPY_HOVER.lock().unwrap(), hover);
                     if hover != old {
-                        *COPY_HOVER.lock().unwrap() = hover;
-                        let _ = InvalidateRect(hwnd, None, false);
+                        present(hwnd);
                     }
+                    let mut tme = TRACKMOUSEEVENT {
+                        cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: hwnd,
+                        dwHoverTime: 0,
+                    };
+                    let _ = TrackMouseEvent(&mut tme);
+                    // Reading takes as long as it takes: while the pointer is
+                    // on the card, it doesn't go away on its own.
+                    let _ = SetTimer(hwnd, TIMER_AUTOHIDE, AUTOHIDE_MS, None);
+                }
+                LRESULT(0)
+            }
+            WM_MOUSELEAVE => {
+                if std::mem::replace(&mut *COPY_HOVER.lock().unwrap(), false) {
+                    present(hwnd);
                 }
                 LRESULT(0)
             }
             WM_PAINT => {
+                // Layered: content goes up through UpdateLayeredWindow.
                 let mut ps = PAINTSTRUCT::default();
-                let hdc = BeginPaint(hwnd, &mut ps);
-                paint_buffered(hwnd, hdc);
+                let _ = BeginPaint(hwnd, &mut ps);
                 let _ = EndPaint(hwnd, &ps);
                 LRESULT(0)
             }
@@ -613,11 +692,16 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wp: WPARAM, lp: LPARAM) -> 
                 let info = &*(lp.0 as *const MSLLHOOKSTRUCT);
                 if let Some(hwnd) = load_hwnd(&POPUP_RAW) {
                     if IsWindowVisible(hwnd).as_bool() {
+                        // The window is the card plus room for its shadow;
+                        // only the card itself counts as "inside".
                         let mut rc = RECT::default();
                         let _ = GetWindowRect(hwnd, &mut rc);
+                        let m = paint::CARD_MARGIN;
                         let (px, py) = (info.pt.x, info.pt.y);
-                        let inside =
-                            px >= rc.left && px < rc.right && py >= rc.top && py < rc.bottom;
+                        let inside = px >= rc.left + m
+                            && px < rc.right - m
+                            && py >= rc.top + m
+                            && py < rc.bottom - m;
                         if !inside {
                             // Don't call hide_popup from the hook thread —
                             // post back to the popup's thread and let the
@@ -661,243 +745,161 @@ unsafe fn uninstall_mouse_hook() {
 }
 
 // ============================================================
-// Painting (double-buffered)
+// Painting — into the card's own DC, card coordinates
 // ============================================================
 
-unsafe fn paint_buffered(hwnd: HWND, hdc: HDC) {
+unsafe fn paint_content(hdc: HDC, layout: &Layout) {
     unsafe {
-        let mut rc = RECT::default();
-        let _ = GetClientRect(hwnd, &mut rc);
-        let (w, h) = (rc.right, rc.bottom);
-        if w <= 0 || h <= 0 {
-            return;
-        }
-
-        let mem_dc = CreateCompatibleDC(hdc);
-        let mem_bmp = CreateCompatibleBitmap(hdc, w, h);
-        let old_bmp = SelectObject(mem_dc, mem_bmp);
-
-        let bg = CreateSolidBrush(COLORREF(theme::CLR_BG));
-        let _ = FillRect(mem_dc, &rc, bg);
-        let _ = DeleteObject(bg);
-
-        paint_content(mem_dc);
-        let _ = BitBlt(hdc, 0, 0, w, h, mem_dc, 0, 0, SRCCOPY);
-
-        SelectObject(mem_dc, old_bmp);
-        let _ = DeleteObject(mem_bmp);
-        let _ = DeleteDC(mem_dc);
-    }
-}
-
-unsafe fn paint_content(hdc: HDC) {
-    unsafe {
-        let layout = calc_layout(hdc);
         let text_guard = POPUP_TEXT.lock().unwrap();
         let Some(text) = text_guard.as_ref() else {
             return;
         };
 
-        // Accent bar.
-        let accent_brush = CreateSolidBrush(COLORREF(theme::CLR_ACCENT));
-        let accent_rc = RECT {
-            left: 0,
-            top: 0,
-            right: MAX_W,
-            bottom: ACCENT_H,
-        };
-        let _ = FillRect(hdc, &accent_rc, accent_brush);
-        let _ = DeleteObject(accent_brush);
-
-        SetBkMode(hdc, TRANSPARENT);
-
-        // Direction label.
-        if layout.has_original && !text.direction.is_empty() {
-            draw_text_block(
+        match &layout.kind {
+            Kind::Loading => {
+                let rc = layout.icon_rect;
+                let cx = (rc.left + rc.right) / 2;
+                let cy = (rc.top + rc.bottom) / 2;
+                draw_spinner(hdc, cx, cy, SPINNER_R, *SPINNER_ANGLE.lock().unwrap());
+            }
+            Kind::Translation(pair) => {
+                let chip = layout.chip_rect;
+                let h = chip.bottom - chip.top;
+                paint::round_rect(
+                    hdc,
+                    &chip,
+                    &paint::Style::flat(h / 2, theme::mix(theme::CLR_ELEVATED, theme::CLR_ACCENT, 60)),
+                );
+                theme::text(
+                    hdc,
+                    pair,
+                    &chip,
+                    theme::ui_font(FONT_CHIP, 700),
+                    theme::lighten(theme::CLR_ACCENT, 70),
+                    theme::DT_CENTER_VCENTER,
+                );
+            }
+            Kind::Info => theme::glyph(
                 hdc,
-                &text.direction,
-                &layout.direction_rect,
-                hfont(&FONT_DIR_RAW),
-                theme::CLR_ACCENT,
+                theme::ICON_INFO,
+                &layout.icon_rect,
+                16,
+                theme::lighten(theme::CLR_ACCENT, 40),
+            ),
+            Kind::Error => theme::glyph(hdc, theme::ICON_WARNING, &layout.icon_rect, 16, theme::CLR_RED),
+            Kind::Plain => {}
+        }
+
+        let main_color = match layout.kind {
+            Kind::Loading => theme::CLR_TEXT_DIM,
+            _ => theme::CLR_TEXT_BRIGHT,
+        };
+        let flags = if layout.kind == Kind::Loading {
+            theme::DT_LEFT_VCENTER
+        } else {
+            theme::DT_WRAP
+        };
+        theme::text(
+            hdc,
+            &text.translated,
+            &layout.text_rect,
+            theme::ui_font(FONT_MAIN, 500),
+            main_color,
+            flags,
+        );
+
+        if layout.show_copy {
+            draw_copy_button(
+                hdc,
+                &layout.copy_btn_rect,
+                *COPY_HOVER.lock().unwrap(),
+                *COPY_DONE.lock().unwrap(),
             );
         }
 
-        // Translated text.
-        let translated_clr = if layout.is_loading {
-            theme::CLR_HINT
-        } else {
-            theme::CLR_TEXT_BRIGHT
-        };
-        draw_text_block(
-            hdc,
-            &text.translated,
-            &layout.translated_rect,
-            hfont(&FONT_MAIN_RAW),
-            translated_clr,
-        );
-
-        // Spinner.
-        if layout.is_loading {
-            let cx = PAD_X + SPINNER_R + 2;
-            let cy = (layout.translated_rect.top + layout.translated_rect.bottom) / 2;
-            let angle = *SPINNER_ANGLE.lock().unwrap();
-            draw_spinner(hdc, cx, cy, SPINNER_R, angle);
-        }
-
-        // Copy / checkmark button.
-        if layout.show_copy {
-            if *COPY_DONE.lock().unwrap() {
-                draw_checkmark(hdc, &layout.copy_btn_rect);
-            } else {
-                draw_copy_icon(hdc, &layout.copy_btn_rect, *COPY_HOVER.lock().unwrap());
-            }
-        }
-
-        // Separator + original text.
         if layout.has_original {
-            let sep_pen = CreatePen(PS_SOLID, 1, COLORREF(theme::CLR_SEPARATOR));
-            let old_pen = SelectObject(hdc, sep_pen);
-            let _ = MoveToEx(hdc, PAD_X, layout.separator_y, None);
-            let _ = LineTo(hdc, MAX_W - PAD_X, layout.separator_y);
-            SelectObject(hdc, old_pen);
-            let _ = DeleteObject(sep_pen);
-
-            draw_text_block(
+            paint::hairline(
+                hdc,
+                PAD_X,
+                CARD_W - PAD_X,
+                layout.separator_y,
+                theme::CLR_SEPARATOR,
+            );
+            theme::text(
                 hdc,
                 &text.original,
                 &layout.original_rect,
-                hfont(&FONT_SMALL_RAW),
+                theme::ui_font(FONT_SMALL, 400),
                 theme::CLR_TEXT_DIM,
+                theme::DT_WRAP,
             );
         }
     }
 }
 
-/// Draws word-wrapped text into a rect with a given font and colour.
-unsafe fn draw_text_block(hdc: HDC, text: &str, rect: &RECT, font: HFONT, colour: u32) {
-    unsafe {
-        SetTextColor(hdc, COLORREF(colour));
-        let old = SelectObject(hdc, font);
-        let mut wide = to_wide(text);
-        if wide.last() == Some(&0) {
-            wide.pop();
-        }
-        let mut rc = *rect;
-        DrawTextW(
-            hdc,
-            &mut wide,
-            &mut rc,
-            DRAW_TEXT_FORMAT(DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL),
-        );
-        SelectObject(hdc, old);
-    }
-}
-
-// ============================================================
-// Drawing helpers
-// ============================================================
-
+/// A ring with a three-quarter arc running round it, antialiased.
 unsafe fn draw_spinner(hdc: HDC, cx: i32, cy: i32, r: i32, angle: i32) {
     unsafe {
-        // Background ring.
-        let bg_pen = CreatePen(PS_SOLID, 2, COLORREF(theme::CLR_SEPARATOR));
-        let old_pen = SelectObject(hdc, bg_pen);
-        let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-        let _ = Ellipse(hdc, cx - r, cy - r, cx + r, cy + r);
-        let _ = DeleteObject(bg_pen);
-
-        // 270-degree foreground arc.
-        let fg_pen = CreatePen(PS_SOLID, 3, COLORREF(theme::CLR_ACCENT));
-        SelectObject(hdc, fg_pen);
-
-        let pi = std::f64::consts::PI;
-        let rf = r as f64;
-        let start_rad = (angle as f64) * pi / 180.0;
-        let end_rad = start_rad + 270.0 * pi / 180.0;
-
-        let x_start = cx + (rf * end_rad.cos()) as i32;
-        let y_start = cy - (rf * end_rad.sin()) as i32;
-        let x_end = cx + (rf * start_rad.cos()) as i32;
-        let y_end = cy - (rf * start_rad.sin()) as i32;
-
-        let _ = Arc(
-            hdc,
-            cx - r,
-            cy - r,
-            cx + r,
-            cy + r,
-            x_start,
-            y_start,
-            x_end,
-            y_end,
-        );
-
-        SelectObject(hdc, old_pen);
-        SelectObject(hdc, old_brush);
-        let _ = DeleteObject(fg_pen);
-    }
-}
-
-unsafe fn draw_copy_icon(hdc: HDC, rect: &RECT, hover: bool) {
-    unsafe {
-        // Ghost button, the way macOS does toolbar glyphs: nothing at rest,
-        // then a soft rounded plate slides in under the pointer.
-        if hover {
-            let plate = CreateSolidBrush(COLORREF(CLR_COPY_PLATE));
-            let plate_pen = CreatePen(PS_SOLID, 1, COLORREF(CLR_COPY_PLATE_BORDER));
-            let op = SelectObject(hdc, plate_pen);
-            let ob = SelectObject(hdc, plate);
-            let r = crate::button::radius(rect.bottom - rect.top) * 2;
-            let _ = RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, r, r);
-            SelectObject(hdc, op);
-            SelectObject(hdc, ob);
-            let _ = DeleteObject(plate);
-            let _ = DeleteObject(plate_pen);
-        }
-
-        let clr = if hover { CLR_COPY_HOVER } else { CLR_COPY_ICON };
-        let pen = CreatePen(PS_SOLID, 1, COLORREF(clr));
-        let old_pen = SelectObject(hdc, pen);
-        let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-
-        let cx = (rect.left + rect.right) / 2;
-        let cy = (rect.top + rect.bottom) / 2;
-
-        // Back sheet.
-        let _ = Rectangle(hdc, cx - 3, cy - 5, cx + 7, cy + 5);
-        // Erase overlap for front sheet — against the plate when it's there.
-        let behind = if hover { CLR_COPY_PLATE } else { theme::CLR_BG };
-        let fill = CreateSolidBrush(COLORREF(behind));
-        let fr = RECT {
-            left: cx - 7,
-            top: cy - 6,
-            right: cx + 4,
-            bottom: cy + 4,
+        let pad = 3;
+        let rc = RECT {
+            left: cx - r - pad,
+            top: cy - r - pad,
+            right: cx + r + pad,
+            bottom: cy + r + pad,
         };
-        let _ = FillRect(hdc, &fr, fill);
-        let _ = DeleteObject(fill);
-        // Front sheet.
-        let _ = Rectangle(hdc, cx - 7, cy - 6, cx + 3, cy + 4);
+        paint::supersampled(hdc, &rc, |dc, ss| {
+            let c = (r + pad) * ss;
+            let rr = r * ss;
+            let ring = CreatePen(PS_SOLID, 2 * ss, COLORREF(theme::CLR_SEPARATOR));
+            let old_pen = SelectObject(dc, ring);
+            let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+            let _ = Ellipse(dc, c - rr, c - rr, c + rr, c + rr);
 
-        SelectObject(hdc, old_pen);
-        SelectObject(hdc, old_brush);
-        let _ = DeleteObject(pen);
+            let arc = CreatePen(PS_SOLID, 2 * ss + ss / 2, COLORREF(theme::CLR_ACCENT));
+            SelectObject(dc, arc);
+            let _ = DeleteObject(ring);
+            let a0 = (angle as f64).to_radians();
+            let a1 = a0 + 270f64.to_radians();
+            let far = (rr * 2) as f64;
+            // Arc runs counter-clockwise from the start radial to the end one.
+            let _ = Arc(
+                dc,
+                c - rr,
+                c - rr,
+                c + rr,
+                c + rr,
+                c + (far * a1.cos()) as i32,
+                c - (far * a1.sin()) as i32,
+                c + (far * a0.cos()) as i32,
+                c - (far * a0.sin()) as i32,
+            );
+            SelectObject(dc, old_pen);
+            SelectObject(dc, old_brush);
+            let _ = DeleteObject(arc);
+        });
     }
 }
 
-unsafe fn draw_checkmark(hdc: HDC, rect: &RECT) {
+/// Ghost button: nothing but the glyph at rest, a soft plate under the
+/// pointer, and a green tick for a moment after copying.
+unsafe fn draw_copy_button(hdc: HDC, rc: &RECT, hover: bool, done: bool) {
     unsafe {
-        let pen = CreatePen(PS_SOLID, 2, COLORREF(CLR_CHECK));
-        let old_pen = SelectObject(hdc, pen);
-
-        let cx = (rect.left + rect.right) / 2;
-        let cy = (rect.top + rect.bottom) / 2;
-
-        let _ = MoveToEx(hdc, cx - 5, cy, None);
-        let _ = LineTo(hdc, cx - 1, cy + 4);
-        let _ = LineTo(hdc, cx + 6, cy - 4);
-
-        SelectObject(hdc, old_pen);
-        let _ = DeleteObject(pen);
+        if hover {
+            paint::round_rect(
+                hdc,
+                rc,
+                &paint::Style::flat(6, theme::lighten(theme::CLR_ELEVATED, 16)),
+            );
+        }
+        if done {
+            theme::glyph(hdc, theme::ICON_CHECK, rc, 14, theme::CLR_GREEN);
+        } else {
+            let color = if hover {
+                theme::CLR_TEXT_BRIGHT
+            } else {
+                theme::CLR_TEXT_DIM
+            };
+            theme::glyph(hdc, theme::ICON_COPY, rc, 14, color);
+        }
     }
 }

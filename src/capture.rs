@@ -2,7 +2,7 @@ use crate::button;
 use crate::i18n;
 use crate::paint;
 use crate::theme;
-use crate::utils::{lparam_to_point, to_wide};
+use crate::utils::lparam_to_point;
 use std::sync::Mutex;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
@@ -413,17 +413,38 @@ fn extract_pixels(
 }
 
 // ============================================================
-// Toolbar buttons
+// The dock: annotation tools and actions in one floating bar
 // ============================================================
 
-const BTN_W: i32 = 124;
-const BTN_H: i32 = 34;
-const BTN_GAP: i32 = 10;
-const BTN_MARGIN: i32 = 12;
+/// Action buttons, left to right: translate, save, full page.
+const BTN_W: i32 = 112;
+const BTN_H: i32 = 32;
 const BTN_COUNT: usize = 3;
+/// Square tool buttons at the dock's leading end.
+const TOOL_SIZE: i32 = 32;
+/// Padding inside the dock, and the gap between its buttons.
+const DOCK_PAD: i32 = 6;
+const DOCK_GAP: i32 = 6;
+/// The divider between tools and actions takes this much room.
+const DOCK_DIVIDER: i32 = 17;
+/// Distance between the selection and the dock.
+const DOCK_MARGIN: i32 = 10;
 
-/// Total width of the toolbar row, buttons plus the gaps between them.
-const TOOLBAR_W: i32 = BTN_W * BTN_COUNT as i32 + BTN_GAP * (BTN_COUNT as i32 - 1);
+/// Which tool each button in the dock arms, left to right.
+const TOOLS: [Tool; 2] = [Tool::Pen, Tool::Rect];
+
+/// Colour every annotation is drawn in, and how thick.  COLORREF is BGR, so
+/// pure red is 0x0000_00FF.
+const INK: u32 = 0x0000_00FF;
+const INK_WIDTH: i32 = 3;
+
+const DOCK_W: i32 = DOCK_PAD * 2
+    + TOOL_SIZE * TOOLS.len() as i32
+    + DOCK_GAP * (TOOLS.len() as i32 - 1)
+    + DOCK_DIVIDER
+    + BTN_W * BTN_COUNT as i32
+    + DOCK_GAP * (BTN_COUNT as i32 - 1);
+const DOCK_H: i32 = BTN_H + DOCK_PAD * 2;
 
 struct BtnRect {
     x: i32,
@@ -432,119 +453,167 @@ struct BtnRect {
     h: i32,
 }
 
-fn toolbar_buttons(
-    sx: i32,
-    sy: i32,
-    sw: i32,
-    sh_sel: i32,
-    screen_h: i32,
-) -> [BtnRect; BTN_COUNT] {
-    let bx = (sx + sw - TOOLBAR_W).max(4);
-
-    let below = sy + sh_sel + BTN_MARGIN;
-    let by = if below + BTN_H + 4 > screen_h {
-        sy - BTN_H - BTN_MARGIN
-    } else {
-        below
+impl BtnRect {
+    fn rect(&self) -> RECT {
+        RECT {
+            left: self.x,
+            top: self.y,
+            right: self.x + self.w,
+            bottom: self.y + self.h,
+        }
     }
-    .max(4);
-
-    std::array::from_fn(|i| BtnRect {
-        x: bx + i as i32 * (BTN_W + BTN_GAP),
-        y: by,
-        w: BTN_W,
-        h: BTN_H,
-    })
 }
+
+/// Where everything in the dock goes for a given selection.
+struct Dock {
+    rc: RECT,
+    tools: [BtnRect; TOOLS.len()],
+    btns: [BtnRect; BTN_COUNT],
+    divider_x: i32,
+    /// Where the keyboard hint goes; the text is right-aligned in it.
+    hint: RECT,
+}
+
+/// The part of the monitor under the selection that the taskbar doesn't
+/// cover, in overlay coordinates.
+///
+/// The taskbar stays on top of the overlay, so anything placed over it can
+/// be seen but not clicked — and a full-page capture is exactly the case
+/// where the selection runs down to the bottom of the page and the dock would
+/// land there.
+fn work_area(rx: i32, ry: i32, rw: i32, rh: i32) -> RECT {
+    let (ox, oy, sw, sh) = screen_bounds();
+    let sel = RECT {
+        left: ox + rx,
+        top: oy + ry,
+        right: ox + rx + rw,
+        bottom: oy + ry + rh,
+    };
+    unsafe {
+        let mon = MonitorFromRect(&sel, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetMonitorInfoW(mon, &mut mi).as_bool() {
+            let w = mi.rcWork;
+            return RECT {
+                left: w.left - ox,
+                top: w.top - oy,
+                right: w.right - ox,
+                bottom: w.bottom - oy,
+            };
+        }
+    }
+    RECT {
+        left: 0,
+        top: 0,
+        right: sw,
+        bottom: sh,
+    }
+}
+
+/// The dock sits under the selection, right-aligned to it.  It moves above
+/// when there's no room below, and tucks inside the bottom edge when there's
+/// no room either side — "room" meaning the work area, never the taskbar.
+fn dock_layout(rx: i32, ry: i32, rw: i32, rh: i32) -> Dock {
+    let work = work_area(rx, ry, rw, rh);
+    let x = (rx + rw - DOCK_W).clamp(work.left + 8, (work.right - DOCK_W - 8).max(work.left + 8));
+    let below = ry + rh + DOCK_MARGIN;
+    let above = ry - DOCK_MARGIN - DOCK_H;
+    let y = if below + DOCK_H + 8 <= work.bottom {
+        below
+    } else if above >= work.top + 8 {
+        above
+    } else {
+        (ry + rh - DOCK_H - DOCK_MARGIN).clamp(work.top + 8, (work.bottom - DOCK_H - 8).max(work.top + 8))
+    };
+
+    let inner_y = y + DOCK_PAD;
+    let mut cx = x + DOCK_PAD;
+    let tools = std::array::from_fn(|_| {
+        let b = BtnRect {
+            x: cx,
+            y: inner_y,
+            w: TOOL_SIZE,
+            h: TOOL_SIZE,
+        };
+        cx += TOOL_SIZE + DOCK_GAP;
+        b
+    });
+    cx += DOCK_DIVIDER - DOCK_GAP;
+    let divider_x = cx - DOCK_DIVIDER / 2 - 1;
+    let btns = std::array::from_fn(|_| {
+        let b = BtnRect {
+            x: cx,
+            y: inner_y,
+            w: BTN_W,
+            h: BTN_H,
+        };
+        cx += BTN_W + DOCK_GAP;
+        b
+    });
+
+    // The hint goes on the far side of the dock from the selection when
+    // there's room for it there, and beside the dock on its left otherwise.
+    let beside = RECT {
+        left: work.left + 8,
+        top: y,
+        right: x - 12,
+        bottom: y + DOCK_H,
+    };
+    let hint = if y == below {
+        let top = y + DOCK_H + 4;
+        if top + HINT_H <= work.bottom {
+            RECT {
+                left: x,
+                top,
+                right: x + DOCK_W,
+                bottom: top + HINT_H,
+            }
+        } else {
+            beside
+        }
+    } else {
+        let top = y - 4 - HINT_H;
+        if top >= work.top {
+            RECT {
+                left: x,
+                top,
+                right: x + DOCK_W,
+                bottom: y - 4,
+            }
+        } else {
+            beside
+        }
+    };
+
+    Dock {
+        rc: RECT {
+            left: x,
+            top: y,
+            right: x + DOCK_W,
+            bottom: y + DOCK_H,
+        },
+        tools,
+        btns,
+        divider_x,
+        hint,
+    }
+}
+
+const HINT_H: i32 = 22;
 
 fn point_in_btn(px: i32, py: i32, btn: &BtnRect) -> bool {
     px >= btn.x && px <= btn.x + btn.w && py >= btn.y && py <= btn.y + btn.h
 }
 
+fn point_in_rect(px: i32, py: i32, rc: &RECT) -> bool {
+    px >= rc.left && px < rc.right && py >= rc.top && py < rc.bottom
+}
+
 fn point_in_selection(px: i32, py: i32, rx: i32, ry: i32, rw: i32, rh: i32) -> bool {
     px >= rx && px < rx + rw && py >= ry && py < ry + rh
-}
-
-// ============================================================
-// Annotation tool strip
-// ============================================================
-
-/// Square buttons stacked down the right-hand side of the selection.
-const TOOL_SIZE: i32 = 34;
-const TOOL_GAP: i32 = 8;
-const TOOL_MARGIN: i32 = 12;
-
-/// Which tool each button in the strip arms, top to bottom.
-const TOOLS: [Tool; 2] = [Tool::Pen, Tool::Rect];
-
-/// Height of the whole strip.
-const TOOL_STRIP_H: i32 = TOOL_SIZE * TOOLS.len() as i32 + TOOL_GAP * (TOOLS.len() as i32 - 1);
-
-/// Colour every annotation is drawn in, and how thick.  COLORREF is BGR, so
-/// pure red is 0x0000_00FF.
-const INK: u32 = 0x0000_00FF;
-const INK_WIDTH: i32 = 3;
-
-/// The strip sits just outside the right edge of the selection, aligned with
-/// its top.  It flips to the left when the selection runs up against the right
-/// edge of the screen, and tucks inside when neither side has room.
-///
-/// The action toolbar is right-aligned to the same edge and sits *below* the
-/// selection, so the two never overlap however small the selection gets.
-fn tool_buttons(rx: i32, ry: i32, rw: i32, screen_w: i32, screen_h: i32) -> [BtnRect; TOOLS.len()] {
-    let outside_right = rx + rw + TOOL_MARGIN;
-    let outside_left = rx - TOOL_MARGIN - TOOL_SIZE;
-    let tx = if outside_right + TOOL_SIZE + 4 <= screen_w {
-        outside_right
-    } else if outside_left >= 4 {
-        outside_left
-    } else {
-        (rx + rw - TOOL_SIZE - 4).max(4)
-    };
-    let ty = ry.min(screen_h - TOOL_STRIP_H - 4).max(4);
-
-    std::array::from_fn(|i| BtnRect {
-        x: tx,
-        y: ty + i as i32 * (TOOL_SIZE + TOOL_GAP),
-        w: TOOL_SIZE,
-        h: TOOL_SIZE,
-    })
-}
-
-// ============================================================
-// Cached overlay fonts (created once, never leaked)
-// ============================================================
-
-struct OverlayFonts {
-    badge: isize,   // -12, weight 600
-    button: isize,  // -13, weight 500 — AppKit labels are near-regular
-    hint: isize,    // -11, weight 400
-    initial: isize, // -16, weight 400
-}
-
-static OVERLAY_FONTS: Mutex<Option<OverlayFonts>> = Mutex::new(None);
-
-fn ensure_fonts() {
-    let mut guard = OVERLAY_FONTS.lock().unwrap();
-    if guard.is_some() {
-        return;
-    }
-    unsafe {
-        *guard = Some(OverlayFonts {
-            badge: CreateFontW(-12, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, w!("Segoe UI")).0
-                as isize,
-            button: CreateFontW(-13, 0, 0, 0, 500, 0, 0, 0, 1, 0, 0, 5, 0, w!("Segoe UI")).0
-                as isize,
-            hint: CreateFontW(-11, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, w!("Segoe UI")).0 as isize,
-            initial: CreateFontW(-16, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, w!("Segoe UI")).0
-                as isize,
-        });
-    }
-}
-
-fn font(f: impl Fn(&OverlayFonts) -> isize) -> HFONT {
-    let guard = OVERLAY_FONTS.lock().unwrap();
-    HFONT(f(guard.as_ref().unwrap()) as *mut _)
 }
 
 // ============================================================
@@ -568,7 +637,6 @@ fn load_overlay() -> Option<HWND> {
 pub fn select_and_capture() -> Option<CaptureAction> {
     STATE.lock().unwrap().reset();
     init_screen_capture();
-    ensure_fonts();
 
     let hwnd = create_overlay()?;
 
@@ -704,24 +772,39 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                         SetCapture(hwnd);
                     }
                     Phase::Toolbar => {
-                        // Precedence, outermost first: the tool strip, then
-                        // ink inside the selection, then the resize handles,
-                        // then the action toolbar — and anything else cancels.
+                        // Precedence: the dock, then ink inside the
+                        // selection, then the resize handles — and anything
+                        // else cancels.  The dock goes first because it can
+                        // sit inside the selection, and a click on one of its
+                        // buttons must never turn into a stroke.
                         let (rx, ry, rw, rh) = s.rect();
                         let tool = s.tool;
-                        let (_, _, screen_w, screen_h) = screen_bounds();
-                        let tools = tool_buttons(rx, ry, rw, screen_w, screen_h);
+                        let dock = dock_layout(rx, ry, rw, rh);
 
-                        if let Some(i) = tools.iter().position(|b| point_in_btn(x, y, b)) {
-                            // Clicking the armed tool disarms it, handing the
-                            // resize handles back.
-                            s.tool = if tool == TOOLS[i] {
-                                Tool::None
-                            } else {
-                                TOOLS[i]
-                            };
-                            drop(s);
-                            let _ = InvalidateRect(hwnd, None, false);
+                        if point_in_rect(x, y, &dock.rc) {
+                            if let Some(i) = dock.tools.iter().position(|b| point_in_btn(x, y, b)) {
+                                // Clicking the armed tool disarms it, handing
+                                // the resize handles back.
+                                s.tool = if tool == TOOLS[i] {
+                                    Tool::None
+                                } else {
+                                    TOOLS[i]
+                                };
+                                drop(s);
+                                let _ = InvalidateRect(hwnd, None, false);
+                            } else if let Some(i) =
+                                dock.btns.iter().position(|b| point_in_btn(x, y, b))
+                            {
+                                s.action = match i {
+                                    0 => Action::Translate,
+                                    1 => Action::Save,
+                                    _ => Action::FullPage,
+                                };
+                                drop(s);
+                                signal_close();
+                            }
+                            // Otherwise the dock's own padding: a near miss,
+                            // not a cancel.
                         } else if tool != Tool::None && point_in_selection(x, y, rx, ry, rw, rh) {
                             s.drawing = Some(match tool {
                                 Tool::Rect => Shape::Rect(RECT {
@@ -742,18 +825,8 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                             drop(s);
                             SetCapture(hwnd);
                         } else {
+                            s.action = Action::Cancel;
                             drop(s);
-                            let btns = toolbar_buttons(rx, ry, rw, rh, screen_h);
-
-                            STATE.lock().unwrap().action = if point_in_btn(x, y, &btns[0]) {
-                                Action::Translate
-                            } else if point_in_btn(x, y, &btns[1]) {
-                                Action::Save
-                            } else if point_in_btn(x, y, &btns[2]) {
-                                Action::FullPage
-                            } else {
-                                Action::Cancel
-                            };
                             signal_close();
                         }
                     }
@@ -826,12 +899,10 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                     let was = (s.hover_btn, s.hover_tool);
                     drop(s);
 
-                    let (_, _, screen_w, screen_h) = screen_bounds();
-                    let btns = toolbar_buttons(rx, ry, rw, rh, screen_h);
-                    let tools = tool_buttons(rx, ry, rw, screen_w, screen_h);
+                    let dock = dock_layout(rx, ry, rw, rh);
                     let now = (
-                        btns.iter().position(|b| point_in_btn(x, y, b)),
-                        tools.iter().position(|b| point_in_btn(x, y, b)),
+                        dock.btns.iter().position(|b| point_in_btn(x, y, b)),
+                        dock.tools.iter().position(|b| point_in_btn(x, y, b)),
                     );
                     if now != was {
                         let mut s = STATE.lock().unwrap();
@@ -1040,27 +1111,9 @@ unsafe fn paint_overlay(hdc: HDC) {
                 if tool == Tool::None {
                     draw_resize_handles(back_dc, rx, ry, rw, rh);
                 }
-                draw_tool_strip(back_dc, &tool_buttons(rx, ry, rw, sw, sh), tool, hover_tool);
-                let btns = toolbar_buttons(rx, ry, rw, rh, sh);
-                let labels = [
-                    i18n::t("capture.btn.translate"),
-                    i18n::t("capture.btn.save"),
-                    i18n::t("capture.btn.fullpage"),
-                ];
-                for (i, (btn, label)) in btns.iter().zip(labels).enumerate() {
-                    let variant = if i == 0 {
-                        button::Variant::Primary
-                    } else {
-                        button::Variant::Secondary
-                    };
-                    let state = if hover_btn == Some(i) {
-                        button::State::Hover
-                    } else {
-                        button::State::Normal
-                    };
-                    draw_button(back_dc, btn, label, variant, state);
-                }
-                draw_hint(back_dc, rx, ry, rw, rh, sh);
+                let dock = dock_layout(rx, ry, rw, rh);
+                draw_dock(back_dc, &dock, tool, hover_tool, hover_btn);
+                draw_hint(back_dc, &dock);
             }
         } else {
             let _ = BitBlt(back_dc, 0, 0, sw, sh, dim_dc, 0, 0, SRCCOPY);
@@ -1151,38 +1204,83 @@ unsafe fn draw_shapes(
     }
 }
 
-unsafe fn draw_tool_strip(hdc: HDC, tools: &[BtnRect], armed: Tool, hover: Option<usize>) {
+/// The dock: a floating dark bar with the annotation tools, a divider, and
+/// the three actions.  The primary action carries the accent.
+unsafe fn draw_dock(
+    hdc: HDC,
+    dock: &Dock,
+    armed: Tool,
+    hover_tool: Option<usize>,
+    hover_btn: Option<usize>,
+) {
     unsafe {
-        for (i, btn) in tools.iter().enumerate() {
-            let rc = RECT {
-                left: btn.x,
-                top: btn.y,
-                right: btn.x + btn.w,
-                bottom: btn.y + btn.h,
-            };
-            let variant = if armed == TOOLS[i] {
-                button::Variant::Primary
-            } else {
-                button::Variant::Secondary
-            };
-            let state = if hover == Some(i) {
-                button::State::Hover
-            } else {
-                button::State::Normal
-            };
-            // The armed button is filled with the ink colour, so the strip
-            // itself says what you are about to draw in.  Its glyph then has
-            // to go white to stay legible.
-            button::draw(hdc, &rc, INK, variant, state);
-            let glyph = if variant == button::Variant::Primary {
+        paint::round_rect(
+            hdc,
+            &dock.rc,
+            &paint::Style::flat(12, theme::CLR_ELEVATED).border(theme::CLR_SEPARATOR),
+        );
+
+        for (i, btn) in dock.tools.iter().enumerate() {
+            let rc = btn.rect();
+            let is_armed = armed == TOOLS[i];
+            // The armed tool is filled with the ink colour, so the dock itself
+            // says what you're about to draw in.
+            if is_armed {
+                paint::round_rect(hdc, &rc, &paint::Style::flat(8, INK));
+            } else if hover_tool == Some(i) {
+                paint::round_rect(
+                    hdc,
+                    &rc,
+                    &paint::Style::flat(8, theme::lighten(theme::CLR_ELEVATED, 18)),
+                );
+            }
+            let glyph = if is_armed {
                 0x00FF_FFFF
             } else {
-                INK
+                theme::CLR_TEXT_BRIGHT
             };
             match TOOLS[i] {
                 Tool::Rect => draw_rect_icon(hdc, &rc, glyph),
                 _ => draw_pencil_icon(hdc, &rc, glyph),
             }
+        }
+
+        let div = RECT {
+            left: dock.divider_x,
+            top: dock.rc.top + 12,
+            right: dock.divider_x + 1,
+            bottom: dock.rc.bottom - 12,
+        };
+        let brush = CreateSolidBrush(COLORREF(theme::CLR_SEPARATOR));
+        let _ = FillRect(hdc, &div, brush);
+        let _ = DeleteObject(brush);
+
+        let labels = [
+            i18n::t("capture.btn.translate"),
+            i18n::t("capture.btn.save"),
+            i18n::t("capture.btn.fullpage"),
+        ];
+        for (i, (btn, label)) in dock.btns.iter().zip(labels).enumerate() {
+            let rc = btn.rect();
+            let variant = if i == 0 {
+                button::Variant::Primary
+            } else {
+                button::Variant::Secondary
+            };
+            let state = if hover_btn == Some(i) {
+                button::State::Hover
+            } else {
+                button::State::Normal
+            };
+            button::draw(hdc, &rc, theme::CLR_ACCENT, variant, state);
+            theme::text(
+                hdc,
+                label,
+                &rc,
+                theme::ui_font(13, 500),
+                button::text_color(variant, state),
+                theme::DT_CENTER_VCENTER | theme::DT_ELLIPSIS,
+            );
         }
     }
 }
@@ -1237,171 +1335,107 @@ unsafe fn draw_rect_icon(hdc: HDC, rc: &RECT, color: u32) {
     }
 }
 
+/// Round white handles with an accent rim, antialiased.
 unsafe fn draw_resize_handles(hdc: HDC, rx: i32, ry: i32, rw: i32, rh: i32) {
     unsafe {
-        let fill = CreateSolidBrush(COLORREF(0x00FF_FFFF));
-        let pen = CreatePen(PS_SOLID, 1, COLORREF(theme::CLR_ACCENT));
-        let op = SelectObject(hdc, pen);
-        let ob = SelectObject(hdc, fill);
+        let style = paint::Style::flat(HANDLE_SIZE / 2, 0x00FF_FFFF)
+            .border(theme::CLR_ACCENT)
+            .border_width(2);
         for h in Handle::all() {
             let r = handle_rect(rx, ry, rw, rh, *h);
-            let _ = Rectangle(hdc, r.left, r.top, r.right, r.bottom);
+            paint::round_rect(hdc, &r, &style);
         }
-        SelectObject(hdc, op);
-        SelectObject(hdc, ob);
-        let _ = DeleteObject(fill);
-        let _ = DeleteObject(pen);
     }
 }
 
+/// "W × H" in a pill above the selection's top-left corner — or just inside
+/// it when the selection starts at the top of the screen.
 unsafe fn draw_size_badge(hdc: HDC, rx: i32, ry: i32, rw: i32, rh: i32) {
     unsafe {
-        let size_text = format!("{rw}x{rh}");
-        let f = font(|f| f.badge);
-        let old_font = SelectObject(hdc, f);
-
-        let mut wide = to_wide(&size_text);
-        if wide.last() == Some(&0) {
-            wide.pop();
-        }
-        let mut measure_rc = RECT {
-            left: 0,
-            top: 0,
-            right: 200,
-            bottom: 0,
-        };
-        DrawTextW(hdc, &mut wide, &mut measure_rc, DRAW_TEXT_FORMAT(0x0C00));
-        let tw = measure_rc.right - measure_rc.left;
-        let th = measure_rc.bottom - measure_rc.top;
-
-        let badge_w = tw + 16;
-        let badge_h = th + 8;
-        let badge_x = rx + rw - badge_w - 4;
-        let badge_y = if ry - badge_h - 6 < 2 {
-            ry + 4
-        } else {
-            ry - badge_h - 6
-        };
-
-        let badge_brush = CreateSolidBrush(COLORREF(theme::CLR_BG));
-        let badge_pen = CreatePen(PS_SOLID, 1, COLORREF(theme::CLR_ACCENT));
-        let old_p = SelectObject(hdc, badge_pen);
-        let old_b = SelectObject(hdc, badge_brush);
-        let _ = RoundRect(
-            hdc,
-            badge_x,
-            badge_y,
-            badge_x + badge_w,
-            badge_y + badge_h,
-            6,
-            6,
-        );
-        SelectObject(hdc, old_p);
-        SelectObject(hdc, old_b);
-        let _ = DeleteObject(badge_brush);
-        let _ = DeleteObject(badge_pen);
-
-        SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, COLORREF(0x00FF_FFFF));
-        let mut badge_rc = RECT {
-            left: badge_x,
-            top: badge_y,
-            right: badge_x + badge_w,
-            bottom: badge_y + badge_h,
-        };
-        DrawTextW(
-            hdc,
-            &mut wide,
-            &mut badge_rc,
-            DRAW_TEXT_FORMAT(DT_CENTER_VCENTER_SINGLE_NOPREFIX),
-        );
-        SelectObject(hdc, old_font);
-    }
-}
-
-const DT_CENTER_VCENTER_SINGLE_NOPREFIX: u32 = 0x0825;
-
-unsafe fn draw_button(
-    hdc: HDC,
-    btn: &BtnRect,
-    text: &str,
-    variant: button::Variant,
-    state: button::State,
-) {
-    unsafe {
+        let text = format!("{rw} \u{00D7} {rh}");
+        let font = theme::ui_font(12, 600);
+        let (tw, th) = theme::measure(hdc, &text, font);
+        let w = tw + 18;
+        let h = th + 8;
+        let y = if ry - h - 8 < 4 { ry + 8 } else { ry - h - 8 };
+        let x = if ry - h - 8 < 4 { rx + 8 } else { rx };
         let rc = RECT {
-            left: btn.x,
-            top: btn.y,
-            right: btn.x + btn.w,
-            bottom: btn.y + btn.h,
+            left: x,
+            top: y,
+            right: x + w,
+            bottom: y + h,
         };
-        button::draw(hdc, &rc, theme::CLR_ACCENT, variant, state);
-
-        let f = font(|f| f.button);
-        let old_font = SelectObject(hdc, f);
-        SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, COLORREF(button::text_color(variant, state)));
-        let mut wide = to_wide(text);
-        if wide.last() == Some(&0) {
-            wide.pop();
-        }
-        let mut trc = rc;
-        DrawTextW(
+        paint::round_rect(
             hdc,
-            &mut wide,
-            &mut trc,
-            DRAW_TEXT_FORMAT(DT_CENTER_VCENTER_SINGLE_NOPREFIX),
+            &rc,
+            &paint::Style::flat(h / 2, theme::CLR_ELEVATED).border(theme::CLR_SEPARATOR),
         );
-        SelectObject(hdc, old_font);
+        theme::text(
+            hdc,
+            &text,
+            &rc,
+            font,
+            theme::CLR_TEXT_BRIGHT,
+            theme::DT_CENTER_VCENTER,
+        );
     }
 }
 
-unsafe fn draw_hint(hdc: HDC, rx: i32, ry: i32, rw: i32, rh: i32, sh: i32) {
+/// A dark pill centred on `cx`, with the text in it.
+unsafe fn draw_pill(hdc: HDC, text: &str, font: HFONT, cx: i32, y: i32, h: i32) {
     unsafe {
-        let btns = toolbar_buttons(rx, ry, rw, rh, sh);
-        let hint = i18n::t("capture.hint.copy");
-        let f = font(|f| f.hint);
-        let old_font = SelectObject(hdc, f);
-        SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, COLORREF(theme::CLR_HINT));
-        let mut wide = to_wide(hint);
-        if wide.last() == Some(&0) {
-            wide.pop();
-        }
-        let mut rc = RECT {
-            left: btns[0].x,
-            top: btns[0].y + BTN_H + 6,
-            right: btns[0].x + TOOLBAR_W,
-            bottom: btns[0].y + BTN_H + 24,
+        let (tw, _) = theme::measure(hdc, text, font);
+        let w = tw + h;
+        let left = cx - w / 2;
+        let rc = RECT {
+            left,
+            top: y,
+            right: left + w,
+            bottom: y + h,
         };
-        DrawTextW(hdc, &mut wide, &mut rc, DRAW_TEXT_FORMAT(0x0802)); // DT_RIGHT | DT_NOPREFIX
-        SelectObject(hdc, old_font);
+        paint::round_rect(
+            hdc,
+            &rc,
+            &paint::Style::flat(h / 2, theme::CLR_ELEVATED).border(theme::CLR_SEPARATOR),
+        );
+        theme::text(hdc, text, &rc, font, theme::CLR_TEXT, theme::DT_CENTER_VCENTER);
+    }
+}
+
+/// The keyboard hint: bare text right-aligned to its slot next to the dock.
+/// It sits on the dimmed backdrop, so a one-pixel dark shadow is enough to
+/// keep it legible over a bright page without a plate behind it.
+unsafe fn draw_hint(hdc: HDC, dock: &Dock) {
+    unsafe {
+        let text = i18n::t("capture.hint.copy");
+        let font = theme::ui_font(12, 400);
+        let rc = RECT {
+            right: dock.hint.right - 6,
+            ..dock.hint
+        };
+        if rc.right - rc.left < 40 {
+            return;
+        }
+        let shadow = RECT {
+            left: rc.left + 1,
+            top: rc.top + 1,
+            right: rc.right + 1,
+            bottom: rc.bottom + 1,
+        };
+        theme::text(hdc, text, &shadow, font, 0x0000_0000, theme::DT_RIGHT_VCENTER);
+        theme::text(hdc, text, &rc, font, theme::CLR_TEXT, theme::DT_RIGHT_VCENTER);
     }
 }
 
 unsafe fn draw_initial_hint(hdc: HDC, sw: i32, sh: i32) {
     unsafe {
-        let hint = i18n::t("capture.hint.initial");
-        let f = font(|f| f.initial);
-        let old_font = SelectObject(hdc, f);
-        SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, COLORREF(0x00C0_C0C0));
-        let mut wide = to_wide(hint);
-        if wide.last() == Some(&0) {
-            wide.pop();
-        }
-        let mut rc = RECT {
-            left: 0,
-            top: sh / 2 - 20,
-            right: sw,
-            bottom: sh / 2 + 20,
-        };
-        DrawTextW(
+        draw_pill(
             hdc,
-            &mut wide,
-            &mut rc,
-            DRAW_TEXT_FORMAT(DT_CENTER_VCENTER_SINGLE_NOPREFIX),
+            i18n::t("capture.hint.initial"),
+            theme::ui_font(15, 500),
+            sw / 2,
+            sh / 2 - 20,
+            40,
         );
-        SelectObject(hdc, old_font);
     }
 }

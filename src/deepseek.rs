@@ -62,6 +62,9 @@ impl Turn {
             content: content.into(),
         }
     }
+    // Kept for symmetry with the other roles; the translator only ever sends
+    // system + user, so nothing calls this today.
+    #[allow(dead_code)]
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: "assistant",

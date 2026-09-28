@@ -1,12 +1,13 @@
 #![windows_subsystem = "windows"]
 
-mod autostart;
 mod ask;
+mod autostart;
 mod autotype;
 mod button;
 mod capture;
 mod deepseek;
 mod explorer_cmd;
+mod gemini;
 mod i18n;
 mod ocr;
 mod paint;
@@ -21,6 +22,7 @@ mod translate;
 mod tray;
 mod uia_scroll;
 mod utils;
+mod websearch;
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -128,6 +130,7 @@ fn main() {
     i18n::set_from_code(&s.language);
     settings::set_current(s.clone());
 
+    theme::enable_dark_menus();
     popup::init();
     tray::create();
     let hotkey_failures = register_hotkeys(&s);
@@ -161,6 +164,10 @@ fn run_main_loop() {
                 if msg.message == tray::WM_TRAY_OPEN_SETTINGS {
                     handle_settings();
                 }
+                // Tab between fields, Enter to save, Esc to close.
+                if settings_ui::is_dialog_message(&msg) {
+                    continue;
+                }
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
@@ -193,6 +200,12 @@ fn run_main_loop() {
                     taskbar_center::stop();
                 }
 
+                // Switched off with the window up: put it away rather than
+                // leave a window whose hotkey no longer exists.
+                if !new.ask_enabled && ask::is_open() {
+                    ask::close();
+                }
+
                 settings::set_current(new);
                 show_hotkey_registration_failures(&hotkey_failures);
             }
@@ -220,7 +233,7 @@ fn dispatch_hotkey(id: i32) {
 // ============================================================
 
 fn register_hotkeys(s: &settings::Settings) -> Vec<String> {
-    let registrations = vec![
+    let mut registrations = vec![
         HotkeyRegistration {
             id: HOTKEY_TRANSLATE,
             label: i18n::t("settings.hotkey.translate").to_string(),
@@ -252,12 +265,6 @@ fn register_hotkeys(s: &settings::Settings) -> Vec<String> {
             required: true,
         },
         HotkeyRegistration {
-            id: HOTKEY_ASK,
-            label: i18n::t("settings.hotkey.ask").to_string(),
-            config: s.hk_ask.clone(),
-            required: true,
-        },
-        HotkeyRegistration {
             id: HOTKEY_SETTINGS,
             label: "Settings window".to_string(),
             config: settings::HotkeyConfig {
@@ -285,6 +292,16 @@ fn register_hotkeys(s: &settings::Settings) -> Vec<String> {
             required: false,
         },
     ];
+    // The ask window is opt-in, and its default combination is one other apps
+    // want too: while it's off, the hotkey isn't taken from them at all.
+    if s.ask_enabled {
+        registrations.push(HotkeyRegistration {
+            id: HOTKEY_ASK,
+            label: i18n::t("settings.hotkey.ask").to_string(),
+            config: s.hk_ask.clone(),
+            required: true,
+        });
+    }
 
     let mut failures = Vec::new();
     unsafe {
@@ -345,7 +362,10 @@ fn handle_text_translate() {
 
     let text = match clipboard_text() {
         Some(t) => t,
-        None => return,
+        None => {
+            println!("[!] Clipboard is empty");
+            return;
+        }
     };
 
     println!("[*] Text: {}...", utils::truncate(&text, 80));
@@ -673,6 +693,9 @@ fn handle_taskbar_center_toggle() {
 /// it puts it away.  Opening carries whatever text is selected into the input
 /// without sending it, so a question can be asked *about* something.
 fn handle_ask() {
+    if !get_settings().ask_enabled {
+        return;
+    }
     if ask::is_open() {
         ask::close();
         return;
@@ -724,18 +747,36 @@ const COPY_SETTLE_DEFAULT: Duration = Duration::from_millis(50);
 /// Watches the clipboard for the result of a `Ctrl+C` we just sent, giving up
 /// at `deadline`.
 ///
-/// The sequence number is what decides: it only moves when something is
-/// actually placed on the clipboard, so an unselected `Ctrl+C` can't hand back
-/// whatever happened to be there from an hour ago.
+/// The sequence number says whether anything was copied at all: it only moves
+/// when something is actually placed on the clipboard, so an unselected
+/// `Ctrl+C` can't hand back whatever happened to be there from an hour ago.
+///
+/// But it only *arms* the read — it does not answer it.  A copy is two steps,
+/// `EmptyClipboard` then `SetClipboardData`, and the number moves on the
+/// first: read on that edge and the clipboard is either momentarily empty or
+/// still holding the previous contents, because an application using delayed
+/// rendering hasn't been asked for the real thing yet.  That is the whole of
+/// the "sometimes nothing arrives, sometimes the last thing does" complaint.
+///
+/// So once armed, keep reading until something readable turns up.  The same
+/// loop covers the source application still holding the clipboard open, where
+/// the read simply fails for a few milliseconds.
 fn await_copy(before: u32, deadline: Instant) -> Option<String> {
+    let mut armed = false;
     while Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(10));
-        if unsafe { GetClipboardSequenceNumber() } != before {
-            return clipboard_text();
+        thread::sleep(CLIPBOARD_POLL);
+        if !armed && unsafe { GetClipboardSequenceNumber() } != before {
+            armed = true;
+        }
+        if armed && let Some(text) = clipboard_text() {
+            return Some(text);
         }
     }
     None
 }
+
+/// How often the clipboard is polled while waiting for a copy to land.
+const CLIPBOARD_POLL: Duration = Duration::from_millis(8);
 
 fn handle_explorer_cmd() {
     println!("[*] Opening CMD in active Explorer folder...");
@@ -819,14 +860,15 @@ fn redirect_stdio_to_log() {
 // Helpers
 // ============================================================
 
-/// Reads text from the clipboard, logging on failure.
+/// Reads text from the clipboard.
+///
+/// Silent: `await_copy` calls this in a loop, where a failure is the ordinary
+/// state of a copy that hasn't landed yet rather than something to report.
+/// The two deliberate readers below say so themselves.
 fn clipboard_text() -> Option<String> {
     match arboard::Clipboard::new().and_then(|mut cb| cb.get_text()) {
         Ok(t) if !t.trim().is_empty() => Some(t.trim().to_string()),
-        _ => {
-            println!("[!] Clipboard is empty");
-            None
-        }
+        _ => None,
     }
 }
 

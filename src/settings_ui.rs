@@ -1,46 +1,63 @@
-//! Settings window — Win32 UI with a custom dark title bar, hand-drawn
-//! input borders, and hover/focus aware buttons.
+//! Settings window — frameless, with a navigation column on the left and one
+//! page of settings at a time on the right.
 //!
 //! Architecture:
-//! * `open()` registers a window class and creates a `WS_POPUP` (no native
-//!   chrome) — all chrome is painted by us in `WM_PAINT` / WM_NCHITTEST.
-//! * Geometry lives in the `layout::*` constants near the top of the file;
-//!   to reshape the window, tweak those and nothing else should break.
-//! * `Resources` lazily caches brushes/fonts that the window needs for
-//!   repeated paints — avoids leaking GDI objects that the old code
-//!   created on every `WM_DRAWITEM`.
-//! * The window proc dispatches to small, single-purpose handlers
-//!   (`paint`, `draw_owner_button`, `hit_test`, `on_command`).
+//! * `open()` creates a captioned popup and then takes the caption away in
+//!   `WM_NCCALCSIZE`, so the whole window is client area.  DWM still draws the
+//!   shadow because the frame is extended one pixel into the client.  Dragging
+//!   comes from `WM_NCHITTEST` answering `HTCAPTION` over the heading strip.
+//! * What each page holds is declared once, in `PAGES`.  `compute_geo` turns
+//!   that into rectangles, and control creation, painting and hit-testing all
+//!   read the same rectangles, so they can't drift apart.
+//! * Every control exists from the start; switching pages only shows and hides
+//!   them.  Saving reads every control, on every page — a key on a page that
+//!   was never opened is still read back exactly as it was loaded.
+//! * All text, cards and field frames are painted by the window itself into
+//!   one off-screen buffer.  Child windows are only the things that take
+//!   input: edits, switches, hotkey fields, the language picker and buttons.
 
 use crate::autostart;
 use crate::button;
 use crate::i18n::{self, Language};
 use crate::paint;
 use crate::settings::{self, HotkeyConfig, Settings};
-use crate::theme::{self, darken, lighten};
+use crate::theme::{self, lighten};
 use crate::utils::to_wide;
 use std::sync::Mutex;
 use windows::Win32::Foundation::*;
+use windows::Win32::Graphics::Dwm::DwmExtendFrameIntoClientArea;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetFocus, GetKeyState, ReleaseCapture, SetCapture, SetFocus,
+    GetFocus, GetKeyState, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT,
+    TrackMouseEvent,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
 // ============================================================
-// Named Win32 style constants (was scattered magic hex)
+// Win32 constants the windows crate doesn't name
 // ============================================================
 
 const BS_OWNERDRAW: WINDOW_STYLE = WINDOW_STYLE(0x000B);
 const ES_AUTOHSCROLL: WINDOW_STYLE = WINDOW_STYLE(0x0080);
-/// Vertically centres a single line of static text in its rect.
-const SS_CENTERIMAGE: WINDOW_STYLE = WINDOW_STYLE(0x0200);
-/// Truncates with "…" instead of clipping mid-glyph.
-const SS_ENDELLIPSIS: WINDOW_STYLE = WINDOW_STYLE(0x4000);
-
-const EM_SETMARGINS: u32 = 0x00D3;
+const EM_SETPASSWORDCHAR: u32 = 0x00CC;
+const WM_MOUSELEAVE: u32 = 0x02A3;
+const EN_SETFOCUS: u16 = 0x0100;
+const EN_KILLFOCUS: u16 = 0x0200;
+const EN_CHANGE: u16 = 0x0300;
+const DLGC_WANTARROWS: isize = 0x0001;
+const DLGC_WANTALLKEYS: isize = 0x0004;
+const DLGC_WANTCHARS: isize = 0x0080;
+const ODS_SELECTED: u32 = 0x0001;
+const ODS_FOCUS: u32 = 0x0010;
+const ODS_NOFOCUSRECT: u32 = 0x0200;
+/// What `IsDialogMessage` sends for Enter and Escape.
+const IDOK_CMD: i32 = 1;
+const IDCANCEL_CMD: i32 = 2;
+/// The bullet a masked key is drawn with.
+const MASK_CHAR: usize = 0x2022;
 
 // Custom messages for our hand-rolled hotkey / language controls.
 // WPARAM/LRESULT both encode (vk | mods << 16) for hotkeys, and a raw index
@@ -49,6 +66,18 @@ const HK_MSG_GET: u32 = WM_USER + 100;
 const HK_MSG_SET: u32 = WM_USER + 101;
 const LANG_MSG_GET: u32 = WM_USER + 200;
 const LANG_MSG_SET: u32 = WM_USER + 201;
+
+// Private window messages.
+/// The folder picker's worker posts the chosen path back through this.
+/// LPARAM carries a `Box::into_raw(Box<String>)`; the handler takes it back.
+const WM_APP_BROWSE_RESULT: u32 = WM_APP + 1;
+/// A key check finished.  WPARAM is the `Service` index.
+const WM_APP_KEY_STATUS: u32 = WM_APP + 2;
+
+/// Debounce timers for re-checking a key while it's being typed, one per
+/// service: `TIMER_KEY + index`.
+const TIMER_KEY: usize = 500;
+const KEY_DEBOUNCE_MS: u32 = 800;
 
 // ============================================================
 // Control IDs
@@ -70,17 +99,112 @@ const IDC_COMBO_LANG: i32 = 114;
 const IDC_CHK_EXPLORER_CMD: i32 = 115;
 const IDC_EDIT_DEEPSEEK: i32 = 116;
 const IDC_HK_ASK: i32 = 117;
+const IDC_EDIT_GEMINI: i32 = 118;
+const IDC_EDIT_SEARCH_KEY: i32 = 119;
+const IDC_CHK_ASK: i32 = 120;
+/// Show/hide toggle inside each key field: `IDC_EYE + Service index`.
+const IDC_EYE: i32 = 130;
 
-// Static-text ids come in ranges, because `WM_CTLCOLORSTATIC` has nothing but
-// the id to decide what a label is: a group title on the window background, a
-// footnote under a card, or a row label sitting on the card itself.
-const IDC_GROUP_TITLE: i32 = 200; // 200..205, one per group
-const IDC_FOOTNOTE: i32 = 250;
-const IDC_ROW_LABEL: i32 = 300; // 300.., one per row label
+fn is_switch_id(id: i32) -> bool {
+    matches!(
+        id,
+        IDC_CHK_PUNTO | IDC_CHK_TASKBAR | IDC_CHK_AUTOSTART | IDC_CHK_EXPLORER_CMD | IDC_CHK_ASK
+    )
+}
 
-/// What we currently know about the configured DeepSeek key.  Checking runs
-/// on a worker thread; the window is told to repaint when it lands.
-#[derive(Clone, PartialEq, Eq)]
+fn is_eye_id(id: i32) -> bool {
+    (IDC_EYE..IDC_EYE + Service::ALL.len() as i32).contains(&id)
+}
+
+// ============================================================
+// API keys and their status
+// ============================================================
+
+/// Every service the app takes a key for.  Each key field shows whether the
+/// key works — a key that silently does nothing is the worst kind of setting.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Service {
+    DeepSeek,
+    Gemini,
+    Tavily,
+}
+
+impl Service {
+    const ALL: [Service; 3] = [Service::DeepSeek, Service::Gemini, Service::Tavily];
+
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    fn edit_id(self) -> i32 {
+        match self {
+            Service::DeepSeek => IDC_EDIT_DEEPSEEK,
+            Service::Gemini => IDC_EDIT_GEMINI,
+            Service::Tavily => IDC_EDIT_SEARCH_KEY,
+        }
+    }
+
+    fn from_edit_id(id: i32) -> Option<Service> {
+        Service::ALL.into_iter().find(|s| s.edit_id() == id)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Service::DeepSeek => "settings.label.deepseek_key",
+            Service::Gemini => "settings.label.gemini_key",
+            Service::Tavily => "settings.label.search_key",
+        }
+    }
+
+    /// "Service unreachable" names the service, so it's per key.
+    fn offline(self) -> &'static str {
+        match self {
+            Service::DeepSeek => "settings.key.offline",
+            Service::Gemini => "settings.key.offline_gemini",
+            Service::Tavily => "settings.key.offline_search",
+        }
+    }
+
+    fn stored(self, s: &Settings) -> &str {
+        match self {
+            Service::DeepSeek => &s.deepseek_api_key,
+            Service::Gemini => &s.gemini_api_key,
+            Service::Tavily => &s.search_api_key,
+        }
+    }
+
+    /// Asks the service whether it accepts `key`, using whichever endpoint
+    /// costs no quota: the model list for DeepSeek and Gemini, the usage
+    /// endpoint for Tavily.  Blocking — call from a worker thread.
+    fn check(self, key: &str) -> KeyStatus {
+        let (status, err) = match self {
+            Service::DeepSeek => match crate::deepseek::check_key(key) {
+                crate::deepseek::KeyCheck::Valid => (KeyStatus::Valid, None),
+                crate::deepseek::KeyCheck::Rejected => (KeyStatus::Rejected, None),
+                crate::deepseek::KeyCheck::Unreachable(e) => (KeyStatus::Unreachable, Some(e)),
+            },
+            Service::Gemini => match crate::gemini::check_key(key) {
+                crate::gemini::KeyCheck::Valid => (KeyStatus::Valid, None),
+                crate::gemini::KeyCheck::Rejected => (KeyStatus::Rejected, None),
+                crate::gemini::KeyCheck::Unreachable(e) => (KeyStatus::Unreachable, Some(e)),
+            },
+            Service::Tavily => match crate::websearch::check_key(key) {
+                crate::websearch::KeyCheck::Valid => (KeyStatus::Valid, None),
+                crate::websearch::KeyCheck::Rejected => (KeyStatus::Rejected, None),
+                crate::websearch::KeyCheck::Unreachable(e) => (KeyStatus::Unreachable, Some(e)),
+            },
+        };
+        if let Some(e) = err {
+            println!("[!] Key check ({}): {e}", self.index());
+        }
+        status
+    }
+}
+
+/// What we currently know about a configured key.  "Valid" means the service
+/// accepted the key — not that quota is left, which only a real request can
+/// tell and which surfaces at use time.
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum KeyStatus {
     Unset,
     Checking,
@@ -89,186 +213,416 @@ enum KeyStatus {
     Unreachable,
 }
 
-static KEY_STATUS: Mutex<KeyStatus> = Mutex::new(KeyStatus::Unset);
-/// The key the current status refers to, so re-checking only happens when the
-/// text actually changed.
-static KEY_CHECKED: Mutex<String> = Mutex::new(String::new());
+/// One per service: its status, and the key that status refers to, so a
+/// re-check only happens when the text actually changed.
+struct KeySlot {
+    status: Mutex<KeyStatus>,
+    checked: Mutex<String>,
+}
 
-/// Posted by the key-checking thread when it has an answer.
-const WM_APP_KEY_STATUS: u32 = WM_APP + 2;
-
-// Private window message: the worker thread running the folder-picker
-// posts the chosen path back to the settings window via this message.
-// LPARAM carries a `Box::into_raw(Box<String>)` pointer, the handler
-// converts it back via Box::from_raw and frees it.
-const WM_APP_BROWSE_RESULT: u32 = WM_APP + 1;
+static KEY_SLOTS: [KeySlot; 3] = [
+    KeySlot {
+        status: Mutex::new(KeyStatus::Unset),
+        checked: Mutex::new(String::new()),
+    },
+    KeySlot {
+        status: Mutex::new(KeyStatus::Unset),
+        checked: Mutex::new(String::new()),
+    },
+    KeySlot {
+        status: Mutex::new(KeyStatus::Unset),
+        checked: Mutex::new(String::new()),
+    },
+];
 
 // ============================================================
-// Layout — all geometry in one place.  Dimensions in px.
+// What goes where
+// ============================================================
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Row {
+    Language,
+    Switch(i32, &'static str),
+    Hotkey(i32, &'static str),
+    Folder,
+    Key(Service),
+}
+
+struct GroupSpec {
+    title: Option<&'static str>,
+    rows: &'static [Row],
+    footnote: Option<&'static str>,
+}
+
+struct PageSpec {
+    title: &'static str,
+    icon: char,
+    groups: &'static [GroupSpec],
+}
+
+static PAGES: [PageSpec; 4] = [
+    PageSpec {
+        title: "settings.section.general",
+        icon: theme::ICON_SETTINGS,
+        groups: &[
+            GroupSpec {
+                title: None,
+                rows: &[Row::Language],
+                footnote: None,
+            },
+            GroupSpec {
+                title: Some("settings.section.functions"),
+                rows: &[
+                    Row::Switch(IDC_CHK_PUNTO, "settings.checkbox.punto"),
+                    Row::Switch(IDC_CHK_TASKBAR, "settings.checkbox.taskbar"),
+                    Row::Switch(IDC_CHK_AUTOSTART, "settings.checkbox.autostart"),
+                    Row::Switch(IDC_CHK_EXPLORER_CMD, "settings.checkbox.explorer_cmd"),
+                ],
+                footnote: None,
+            },
+            GroupSpec {
+                title: Some("settings.section.folder"),
+                rows: &[Row::Folder],
+                footnote: Some("settings.hint.folder"),
+            },
+        ],
+    },
+    PageSpec {
+        title: "settings.section.hotkeys",
+        icon: theme::ICON_KEYBOARD,
+        groups: &[GroupSpec {
+            title: None,
+            rows: &[
+                Row::Hotkey(IDC_HK_TRANSLATE, "settings.hotkey.translate"),
+                Row::Hotkey(IDC_HK_OCR, "settings.hotkey.ocr"),
+                Row::Hotkey(IDC_HK_SCREENSHOT, "settings.hotkey.screenshot"),
+                Row::Hotkey(IDC_HK_LAYOUT, "settings.hotkey.layout"),
+                Row::Hotkey(IDC_HK_EXPLORER_CMD, "settings.hotkey.explorer_cmd"),
+            ],
+            footnote: Some("settings.hint.hotkeys"),
+        }],
+    },
+    PageSpec {
+        title: "settings.section.translation",
+        icon: theme::ICON_TRANSLATE,
+        groups: &[GroupSpec {
+            title: None,
+            rows: &[Row::Key(Service::DeepSeek)],
+            footnote: Some("settings.hint.deepseek"),
+        }],
+    },
+    PageSpec {
+        title: "settings.hotkey.ask",
+        icon: theme::ICON_CHAT,
+        groups: &[
+            GroupSpec {
+                title: None,
+                rows: &[
+                    Row::Switch(IDC_CHK_ASK, "settings.checkbox.ask"),
+                    Row::Hotkey(IDC_HK_ASK, "settings.label.shortcut"),
+                ],
+                footnote: Some("settings.hint.ask"),
+            },
+            GroupSpec {
+                title: Some("settings.section.keys"),
+                rows: &[Row::Key(Service::Gemini), Row::Key(Service::Tavily)],
+                footnote: Some("settings.hint.search"),
+            },
+        ],
+    },
+];
+
+// ============================================================
+// Geometry — all in px
 // ============================================================
 
 mod layout {
-    pub const WIN_W: i32 = 520;
-    pub const MARGIN: i32 = 20;
-    pub const CARD_W: i32 = WIN_W - MARGIN * 2;
-    pub const CARD_R: i32 = 10;
+    pub const WIN_W: i32 = 720;
+    pub const SIDEBAR_W: i32 = 208;
 
-    /// One row of a grouped list.
-    pub const ROW_H: i32 = 42;
-    /// Breathing room inside a row — and how far the hairline between two rows
-    /// stops short of the left edge, the way grouped lists indent theirs.
+    /// Content column, between the sidebar and the right edge.
+    pub const PAD: i32 = 28;
+    pub const CX0: i32 = SIDEBAR_W + PAD;
+    pub const CX1: i32 = WIN_W - PAD;
+
+    /// The strip across the top that drags the window.
+    pub const DRAG_H: i32 = 60;
+    /// Page heading, and where the first card starts below it.
+    pub const HEADING_Y: i32 = 22;
+    pub const HEADING_H: i32 = 30;
+    pub const CONTENT_TOP: i32 = 70;
+
+    pub const CARD_R: i32 = 8;
+    pub const ROW_H: i32 = 44;
+    /// A key row: label and status on one line, the field full-width below.
+    pub const KEY_ROW_H: i32 = 82;
     pub const ROW_PAD: i32 = 14;
 
-    /// Secondary-colour title sitting above each card.
     pub const TITLE_H: i32 = 18;
-    pub const TITLE_GAP: i32 = 6;
-    /// Between one card and the next group's title.
-    pub const GROUP_GAP: i32 = 16;
-    /// Explanatory line under a card.
-    pub const FOOTNOTE_GAP: i32 = 7;
-    pub const FOOTNOTE_H: i32 = 32;
+    pub const TITLE_GAP: i32 = 8;
+    pub const GROUP_GAP: i32 = 22;
+    pub const FOOTNOTE_GAP: i32 = 8;
 
-    pub const TOP: i32 = 16;
-    pub const BOTTOM: i32 = 18;
-
-    /// Height of a control sitting in a row, and the width of the value column
-    /// they all line up in.
-    pub const CTRL_H: i32 = 28;
-    pub const VALUE_W: i32 = 188;
+    /// Controls sitting in a row, and the value column they line up in.
+    pub const CTRL_H: i32 = 30;
+    pub const VALUE_W: i32 = 212;
+    pub const KEY_FIELD_H: i32 = 32;
+    /// A native edit is only as tall as its line, centred in its frame.
+    pub const EDIT_H: i32 = 20;
+    pub const EYE_W: i32 = 30;
 
     pub const SWITCH_W: i32 = 40;
-    pub const SWITCH_H: i32 = 24;
+    pub const SWITCH_H: i32 = 22;
 
-    pub const BTN_W: i32 = 96;
-    pub const BTN_H: i32 = 30;
-    pub const BTN_GAP: i32 = 10;
-    pub const BROWSE_W: i32 = 96;
+    pub const BTN_W: i32 = 112;
+    pub const BTN_H: i32 = 32;
+    pub const BTN_GAP: i32 = 8;
+    pub const BROWSE_W: i32 = 104;
+    pub const FOOTER_GAP: i32 = 24;
+    pub const FOOTER_PAD: i32 = 22;
+
+    pub const NAV_TOP: i32 = 70;
+    pub const NAV_H: i32 = 38;
+    pub const NAV_GAP: i32 = 2;
+    pub const NAV_INSET: i32 = 10;
+
+    pub const CLOSE_W: i32 = 46;
+    pub const CLOSE_H: i32 = 34;
 }
 
-/// Group indices, so call sites read as English rather than magic numbers.
-const G_GENERAL: usize = 0;
-const G_TRANSLATION: usize = 1;
-const G_SHORTCUTS: usize = 2;
-const G_SCREENSHOTS: usize = 3;
-const G_FEATURES: usize = 4;
+// Type sizes.
+const FONT_BODY: i32 = 14;
+const FONT_META: i32 = 12;
+const FONT_TITLE: i32 = 13;
+const FONT_HEADING: i32 = 22;
 
-/// Rows per group, and whether a footnote follows the card.  Translation has
-/// two: the key, and whether that key actually works.
-const GROUP_SPEC: [(usize, bool); 5] = [(1, false), (2, true), (6, false), (1, false), (4, false)];
+fn row_height(r: &Row) -> i32 {
+    match r {
+        Row::Key(_) => layout::KEY_ROW_H,
+        _ => layout::ROW_H,
+    }
+}
 
-/// One group: a title, a rounded card, and the rows inside it.
-struct Group {
-    title_y: i32,
+#[derive(Clone, Copy)]
+struct RowGeo {
+    row: Row,
+    top: i32,
+    h: i32,
+}
+
+struct GroupGeo {
+    title: Option<(&'static str, i32)>,
     card: RECT,
-    rows: usize,
-    footnote_y: Option<i32>,
+    rows: Vec<RowGeo>,
+    footnote: Option<(&'static str, RECT)>,
 }
 
-impl Group {
-    fn row_top(&self, i: usize) -> i32 {
-        self.card.top + i as i32 * layout::ROW_H
-    }
-
-    /// Vertically centred slot of height `h`, right-aligned inside row `i`.
-    fn trailing(&self, i: usize, w: i32, h: i32) -> RECT {
-        let top = self.row_top(i) + (layout::ROW_H - h) / 2;
-        RECT {
-            left: self.card.right - layout::ROW_PAD - w,
-            top,
-            right: self.card.right - layout::ROW_PAD,
-            bottom: top + h,
-        }
-    }
-
-    /// Label slot in row `i`, running from the left padding up to `right`.
-    fn leading(&self, i: usize, right: i32) -> RECT {
-        RECT {
-            left: self.card.left + layout::ROW_PAD,
-            top: self.row_top(i),
-            right,
-            bottom: self.row_top(i) + layout::ROW_H,
-        }
-    }
-}
-
-/// Whole-window geometry, computed in one place so control creation, painting
-/// and hit-testing can't drift apart as groups gain or lose rows.
-struct Page {
-    groups: Vec<Group>,
-    buttons_y: i32,
+struct Geo {
+    pages: Vec<Vec<GroupGeo>>,
     height: i32,
 }
 
-fn page() -> Page {
+static GEO: Mutex<Option<Geo>> = Mutex::new(None);
+
+fn with_geo<R>(f: impl FnOnce(&Geo) -> R) -> R {
+    f(GEO.lock().unwrap().as_ref().expect("settings geometry"))
+}
+
+/// Lays every page out once.  Needs a DC because footnotes wrap, and how many
+/// lines they take depends on the language.
+unsafe fn compute_geo(hdc: HDC) -> Geo {
     use layout::*;
-
-    let mut y = TOP;
-    let mut groups = Vec::with_capacity(GROUP_SPEC.len());
-
-    for (rows, has_footnote) in GROUP_SPEC {
-        let title_y = y;
-        y += TITLE_H + TITLE_GAP;
-
-        let card = RECT {
-            left: MARGIN,
-            top: y,
-            right: MARGIN + CARD_W,
-            bottom: y + ROW_H * rows as i32,
-        };
-        y = card.bottom;
-
-        let mut footnote_y = None;
-        if has_footnote {
-            let fy = y + FOOTNOTE_GAP;
-            footnote_y = Some(fy);
-            y = fy + FOOTNOTE_H;
+    let foot_font = theme::ui_font(FONT_META, 400);
+    let mut pages = Vec::new();
+    let mut bottom = 0;
+    for page in PAGES.iter() {
+        let mut y = CONTENT_TOP;
+        let mut groups = Vec::new();
+        for (gi, g) in page.groups.iter().enumerate() {
+            if gi > 0 {
+                y += GROUP_GAP;
+            }
+            let title = g.title.map(|k| {
+                let t = (k, y);
+                y += TITLE_H + TITLE_GAP;
+                t
+            });
+            let top = y;
+            let mut rows = Vec::new();
+            for r in g.rows {
+                let h = row_height(r);
+                rows.push(RowGeo { row: *r, top: y, h });
+                y += h;
+            }
+            let card = RECT {
+                left: CX0,
+                top,
+                right: CX1,
+                bottom: y,
+            };
+            let footnote = g.footnote.map(|k| {
+                let w = CX1 - CX0 - 8;
+                let fh = unsafe { theme::measure_wrapped(hdc, i18n::t(k), foot_font, w) };
+                let rc = RECT {
+                    left: CX0 + 4,
+                    top: y + FOOTNOTE_GAP,
+                    right: CX0 + 4 + w,
+                    bottom: y + FOOTNOTE_GAP + fh,
+                };
+                y = rc.bottom;
+                (k, rc)
+            });
+            groups.push(GroupGeo {
+                title,
+                card,
+                rows,
+                footnote,
+            });
         }
-        y += GROUP_GAP;
-
-        groups.push(Group {
-            title_y,
-            card,
-            rows,
-            footnote_y,
-        });
+        bottom = bottom.max(y);
+        pages.push(groups);
     }
-
-    let buttons_y = y;
-    Page {
-        groups,
-        buttons_y,
-        height: buttons_y + BTN_H + BOTTOM,
+    let nav_bottom = NAV_TOP + PAGES.len() as i32 * (NAV_H + NAV_GAP);
+    Geo {
+        pages,
+        height: bottom.max(nav_bottom) + FOOTER_GAP + BTN_H + FOOTER_PAD,
     }
 }
 
+/// Vertically centred slot of `w`×`h`, right-aligned in the row.
+fn trailing(card: &RECT, r: &RowGeo, w: i32, h: i32) -> RECT {
+    let top = r.top + (r.h - h) / 2;
+    RECT {
+        left: card.right - layout::ROW_PAD - w,
+        top,
+        right: card.right - layout::ROW_PAD,
+        bottom: top + h,
+    }
+}
+
+/// The frame of a key row's field: full width, below the label line.
+fn key_field(card: &RECT, r: &RowGeo) -> RECT {
+    let top = r.top + 36;
+    RECT {
+        left: card.left + layout::ROW_PAD,
+        top,
+        right: card.right - layout::ROW_PAD,
+        bottom: top + layout::KEY_FIELD_H,
+    }
+}
+
+/// A key row's label line.
+fn key_label_line(card: &RECT, r: &RowGeo) -> RECT {
+    RECT {
+        left: card.left + layout::ROW_PAD,
+        top: r.top + 8,
+        right: card.right - layout::ROW_PAD,
+        bottom: r.top + 34,
+    }
+}
+
+fn folder_field(card: &RECT, r: &RowGeo) -> RECT {
+    let browse = trailing(card, r, layout::BROWSE_W, layout::CTRL_H);
+    RECT {
+        left: card.left + layout::ROW_PAD,
+        top: browse.top,
+        right: browse.left - 8,
+        bottom: browse.bottom,
+    }
+}
+
+/// Where the native edit sits inside a field frame: one line tall, centred,
+/// leaving `right_gap` free at the end for the show/hide toggle.
+fn edit_in(frame: &RECT, right_gap: i32) -> RECT {
+    let top = frame.top + (frame.bottom - frame.top - layout::EDIT_H) / 2;
+    RECT {
+        left: frame.left + 10,
+        top,
+        right: frame.right - 10 - right_gap,
+        bottom: top + layout::EDIT_H,
+    }
+}
+
+fn eye_rect(frame: &RECT) -> RECT {
+    let h = frame.bottom - frame.top - 6;
+    RECT {
+        left: frame.right - 3 - layout::EYE_W,
+        top: frame.top + 3,
+        right: frame.right - 3,
+        bottom: frame.top + 3 + h,
+    }
+}
+
+/// Every native edit frame on page `page`, with the edit's control id.
+fn field_frames(page: usize) -> Vec<(i32, RECT)> {
+    with_geo(|geo| {
+        let mut out = Vec::new();
+        for g in &geo.pages[page] {
+            for r in &g.rows {
+                match r.row {
+                    Row::Folder => out.push((IDC_EDIT_FOLDER, folder_field(&g.card, r))),
+                    Row::Key(s) => out.push((s.edit_id(), key_field(&g.card, r))),
+                    _ => {}
+                }
+            }
+        }
+        out
+    })
+}
+
+/// The page a key row lives on, and its label line.
+fn key_status_rect(svc: Service) -> Option<(usize, RECT)> {
+    with_geo(|geo| {
+        for (p, groups) in geo.pages.iter().enumerate() {
+            for g in groups {
+                for r in &g.rows {
+                    if r.row == Row::Key(svc) {
+                        return Some((p, key_label_line(&g.card, r)));
+                    }
+                }
+            }
+        }
+        None
+    })
+}
+
+fn nav_rect(i: usize) -> RECT {
+    use layout::*;
+    let top = NAV_TOP + i as i32 * (NAV_H + NAV_GAP);
+    RECT {
+        left: NAV_INSET,
+        top,
+        right: SIDEBAR_W - NAV_INSET,
+        bottom: top + NAV_H,
+    }
+}
+
+fn close_rect() -> RECT {
+    use layout::*;
+    RECT {
+        left: WIN_W - CLOSE_W,
+        top: 0,
+        right: WIN_W,
+        bottom: CLOSE_H,
+    }
+}
+
+fn contains(rc: &RECT, x: i32, y: i32) -> bool {
+    x >= rc.left && x < rc.right && y >= rc.top && y < rc.bottom
+}
+
+fn intersects(a: &RECT, b: &RECT) -> bool {
+    a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
+}
+
 // ============================================================
-// Local palette (everything else comes from theme::*)
-// ============================================================
-
-/// The current choice in the open language list; the hovered row takes the
-/// accent instead.
-const CLR_ROW_SELECTED: u32 = 0x0032_3232;
-
-/// Corner radius of a text field, a hotkey field or a popup list.
-const FIELD_R: i32 = 6;
-
-// Status colours, matching macOS dark-appearance system green/red/orange.
-const CLR_GREEN: u32 = 0x0058_D130;
-const CLR_RED: u32 = 0x003A_45FF;
-const CLR_ORANGE: u32 = 0x000A_9FFF;
-
-// ============================================================
-// Resources — GDI objects cached for the lifetime of the window.
+// Window-level state
 // ============================================================
 
 struct Resources {
     bg_brush: isize,
     card_brush: isize,
     field_brush: isize,
-    font_body: isize,
-    font_group: isize,
-    font_meta: isize,
-    font_button: isize,
 }
 
 impl Resources {
@@ -278,13 +632,6 @@ impl Resources {
                 bg_brush: CreateSolidBrush(COLORREF(theme::CLR_BG)).0 as isize,
                 card_brush: CreateSolidBrush(COLORREF(theme::CLR_CARD)).0 as isize,
                 field_brush: CreateSolidBrush(COLORREF(theme::CLR_FIELD)).0 as isize,
-                font_body: make_font(-14, 400).0 as isize,
-                // Group titles carry structure by colour and position, not by
-                // shouting — no caps, no bold.
-                font_group: make_font(-13, 500).0 as isize,
-                font_meta: make_font(-12, 400).0 as isize,
-                // AppKit button labels sit near regular weight.
-                font_button: make_font(-13, 500).0 as isize,
             }
         }
     }
@@ -297,58 +644,52 @@ impl Resources {
     fn field_brush(&self) -> HBRUSH {
         HBRUSH(self.field_brush as *mut _)
     }
-    fn font_body(&self) -> HFONT {
-        HFONT(self.font_body as *mut _)
-    }
-    fn font_group(&self) -> HFONT {
-        HFONT(self.font_group as *mut _)
-    }
-    fn font_meta(&self) -> HFONT {
-        HFONT(self.font_meta as *mut _)
-    }
-    fn font_button(&self) -> HFONT {
-        HFONT(self.font_button as *mut _)
-    }
 }
 
-unsafe fn make_font(height: i32, weight: i32) -> HFONT {
-    unsafe {
-        CreateFontW(
-            height,
-            0,
-            0,
-            0,
-            weight,
-            0,
-            0,
-            0,
-            1,
-            0,
-            0,
-            5,
-            0,
-            w!("Segoe UI"),
-        )
-    }
-}
-
-// ============================================================
-// Window-level state
-// ============================================================
-
-static SETTINGS_HWND: Mutex<isize> = Mutex::new(0);
-static UPDATED_SETTINGS: Mutex<Option<Box<Settings>>> = Mutex::new(None);
 static RES: Mutex<Option<Box<Resources>>> = Mutex::new(None);
 
 fn res() -> std::sync::MutexGuard<'static, Option<Box<Resources>>> {
-    RES.lock().unwrap()
-}
-
-fn ensure_res() {
     let mut g = RES.lock().unwrap();
     if g.is_none() {
         *g = Some(Box::new(Resources::new()));
     }
+    g
+}
+
+static SETTINGS_HWND: Mutex<isize> = Mutex::new(0);
+static UPDATED_SETTINGS: Mutex<Option<Box<Settings>>> = Mutex::new(None);
+
+/// The page on show.
+static PAGE: Mutex<usize> = Mutex::new(0);
+
+/// Every child control, with the page it belongs to (`usize::MAX` = all
+/// pages, for the footer buttons).
+static CONTROLS: Mutex<Vec<(isize, usize)>> = Mutex::new(Vec::new());
+const ALL_PAGES: usize = usize::MAX;
+
+/// What the pointer is over among the things the window paints itself.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Hover {
+    None,
+    Nav(usize),
+    Close,
+}
+static HOVER: Mutex<Hover> = Mutex::new(Hover::None);
+static TRACKING: Mutex<bool> = Mutex::new(false);
+
+/// The owner-drawn button under the pointer.  Only one can be, so one slot
+/// covers them all.
+static HOT_BUTTON: Mutex<isize> = Mutex::new(0);
+/// The BUTTON class's own window procedure, which the hover subclass wraps.
+static BUTTON_PROC: Mutex<isize> = Mutex::new(0);
+
+fn settings_hwnd() -> Option<HWND> {
+    let v = *SETTINGS_HWND.lock().unwrap();
+    (v != 0).then_some(HWND(v as *mut _))
+}
+
+fn current_page() -> usize {
+    *PAGE.lock().unwrap()
 }
 
 // ============================================================
@@ -358,22 +699,18 @@ fn ensure_res() {
 pub fn open(current: &Settings) {
     unsafe {
         // Reuse existing window if still alive.
-        let v = *SETTINGS_HWND.lock().unwrap();
-        if v != 0 {
-            let hwnd = HWND(v as *mut _);
+        if let Some(hwnd) = settings_hwnd() {
             if IsWindow(hwnd).as_bool() {
                 let _ = SetForegroundWindow(hwnd);
                 return;
             }
         }
 
-        ensure_res();
-
         let Some(hmodule) = GetModuleHandleW(None).ok() else {
             return;
         };
         let hinstance = HINSTANCE(hmodule.0);
-        let class = w!("ScrTransSettings7");
+        let class = w!("ScrTransSettings8");
 
         let wc = WNDCLASSW {
             style: CS_HREDRAW | CS_VREDRAW,
@@ -386,33 +723,49 @@ pub fn open(current: &Settings) {
         };
         RegisterClassW(&wc);
 
-        let sw = GetSystemMetrics(SM_CXSCREEN);
-        let sh = GetSystemMetrics(SM_CYSCREEN);
+        let screen = GetDC(None);
+        *GEO.lock().unwrap() = Some(compute_geo(screen));
+        ReleaseDC(None, screen);
+        let win_h = with_geo(|g| g.height);
+        let win_w = layout::WIN_W;
+
+        // Centre on the monitor under the pointer — on a multi-monitor setup
+        // that's the one being looked at.
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let work = if GetMonitorInfoW(mon, &mut mi).as_bool() {
+            mi.rcWork
+        } else {
+            RECT {
+                left: 0,
+                top: 0,
+                right: GetSystemMetrics(SM_CXSCREEN),
+                bottom: GetSystemMetrics(SM_CYSCREEN),
+            }
+        };
+        let x = work.left + (work.right - work.left - win_w) / 2;
+        let y = work.top + ((work.bottom - work.top - win_h) / 2).max(0);
+
+        *PAGE.lock().unwrap() = 0;
+        *HOVER.lock().unwrap() = Hover::None;
 
         let title = to_wide(i18n::t("settings.title"));
+        // The caption is there for DWM — shadow, snap, a taskbar-less window
+        // that still behaves like one — and taken away in WM_NCCALCSIZE.
         let style = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN;
         let ex_style = WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
-
-        // AdjustWindowRectEx expands the client rect we want into the
-        // total window rect (client + caption + borders).  That way the
-        // content inside the window is exactly WIN_H_CLIENT tall.
-        let mut rc = RECT {
-            left: 0,
-            top: 0,
-            right: layout::WIN_W,
-            bottom: page().height,
-        };
-        let _ = AdjustWindowRectEx(&mut rc, style, false, ex_style);
-        let win_w = rc.right - rc.left;
-        let win_h = rc.bottom - rc.top;
-
         let hwnd = CreateWindowExW(
             ex_style,
             class,
             PCWSTR(title.as_ptr()),
             style,
-            (sw - win_w) / 2,
-            (sh - win_h) / 2,
+            x,
+            y,
             win_w,
             win_h,
             HWND::default(),
@@ -428,8 +781,33 @@ pub fn open(current: &Settings) {
 
         *SETTINGS_HWND.lock().unwrap() = hwnd.0 as isize;
         theme::dark_titlebar(hwnd);
+        theme::round_corners(hwnd);
+        let margins = MARGINS {
+            cxLeftWidth: 0,
+            cxRightWidth: 0,
+            cyTopHeight: 1,
+            cyBottomHeight: 0,
+        };
+        let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+        let _ = SetWindowPos(
+            hwnd,
+            HWND::default(),
+            0,
+            0,
+            0,
+            0,
+            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+
         create_controls(hwnd, hinstance, current);
-        start_key_check(hwnd, &current.deepseek_api_key);
+        // Focus rings stay hidden until the keyboard is used, the way a
+        // dialog starts out — otherwise every mouse click leaves one behind.
+        // WM_CHANGEUISTATE, MAKEWPARAM(UIS_SET, UISF_HIDEFOCUS | UISF_HIDEACCEL).
+        SendMessageW(hwnd, 0x0127, WPARAM(1 | (3 << 16)), LPARAM(0));
+        show_page(hwnd, 0);
+        for svc in Service::ALL {
+            start_key_check(svc, svc.stored(current));
+        }
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
     }
@@ -439,6 +817,35 @@ pub fn take_updated_settings() -> Option<Settings> {
     UPDATED_SETTINGS.lock().unwrap().take().map(|b| *b)
 }
 
+/// Keyboard handling a dialog gets for free: Tab and Shift+Tab between
+/// fields, Enter to save, Escape to close — plus Ctrl+Tab between pages.
+/// Called from the main message loop; true means the message was handled.
+pub fn is_dialog_message(msg: &MSG) -> bool {
+    unsafe {
+        let Some(hwnd) = settings_hwnd() else {
+            return false;
+        };
+        if msg.hwnd != hwnd && !IsChild(hwnd, msg.hwnd).as_bool() {
+            return false;
+        }
+        if msg.message == WM_KEYDOWN {
+            let ctrl = GetKeyState(0x11) < 0;
+            let shift = GetKeyState(0x10) < 0;
+            let step = match msg.wParam.0 {
+                0x09 if ctrl => Some(if shift { PAGES.len() - 1 } else { 1 }),
+                0x22 if ctrl => Some(1),               // Ctrl+PgDn
+                0x21 if ctrl => Some(PAGES.len() - 1), // Ctrl+PgUp
+                _ => None,
+            };
+            if let Some(step) = step {
+                show_page(hwnd, (current_page() + step) % PAGES.len());
+                return true;
+            }
+        }
+        IsDialogMessageW(hwnd, msg).as_bool()
+    }
+}
+
 // ============================================================
 // Controls
 // ============================================================
@@ -446,551 +853,297 @@ pub fn take_updated_settings() -> Option<Settings> {
 unsafe fn create_controls(parent: HWND, hinst: HINSTANCE, s: &Settings) {
     unsafe {
         use layout::*;
-        let r_guard = res();
-        let r = r_guard.as_ref().unwrap();
-        let page = page();
-        let mut label_id = IDC_ROW_LABEL;
+        CONTROLS.lock().unwrap().clear();
+        let body = theme::ui_font(FONT_BODY, 400);
+        let button_font = theme::ui_font(FONT_BODY, 500);
 
-        // Group titles.
-        for (i, key) in [
-            "settings.section.general",
-            "settings.section.translation",
-            "settings.section.hotkeys",
-            "settings.section.folder",
-            "settings.section.functions",
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            create_label(
-                parent,
-                hinst,
-                r.font_group(),
-                MARGIN + 2,
-                page.groups[i].title_y,
-                CARD_W,
-                TITLE_H,
-                i18n::t(key),
-                IDC_GROUP_TITLE + i as i32,
-                LabelKind::GroupTitle,
-            );
+        let rows: Vec<(usize, RECT, RowGeo)> = with_geo(|geo| {
+            geo.pages
+                .iter()
+                .enumerate()
+                .flat_map(|(p, groups)| {
+                    groups
+                        .iter()
+                        .flat_map(move |g| g.rows.iter().map(move |r| (p, g.card, *r)))
+                })
+                .collect()
+        });
+
+        for (page, card, r) in rows {
+            match r.row {
+                Row::Language => {
+                    let rc = trailing(&card, &r, VALUE_W, CTRL_H);
+                    let h = create_lang_combo(parent, hinst, &rc, &s.language);
+                    register(h, page);
+                }
+                Row::Switch(id, _) => {
+                    let rc = trailing(&card, &r, SWITCH_W, SWITCH_H);
+                    let on = match id {
+                        IDC_CHK_PUNTO => s.punto_enabled,
+                        IDC_CHK_TASKBAR => s.taskbar_center_enabled,
+                        IDC_CHK_AUTOSTART => autostart::is_enabled(),
+                        IDC_CHK_EXPLORER_CMD => crate::explorer_cmd::is_menu_enabled(),
+                        IDC_CHK_ASK => s.ask_enabled,
+                        _ => false,
+                    };
+                    let h = create_owner_button(parent, hinst, &rc, "", id, body);
+                    SetWindowLongPtrW(h, GWLP_USERDATA, on as isize);
+                    register(h, page);
+                }
+                Row::Hotkey(id, _) => {
+                    let rc = trailing(&card, &r, VALUE_W, CTRL_H);
+                    let hk = match id {
+                        IDC_HK_TRANSLATE => &s.hk_translate,
+                        IDC_HK_OCR => &s.hk_ocr,
+                        IDC_HK_SCREENSHOT => &s.hk_screenshot,
+                        IDC_HK_LAYOUT => &s.hk_layout,
+                        IDC_HK_EXPLORER_CMD => &s.hk_explorer_cmd,
+                        _ => &s.hk_ask,
+                    };
+                    let h = create_hotkey_field(parent, hinst, &rc, id, hk);
+                    register(h, page);
+                }
+                Row::Folder => {
+                    let frame = folder_field(&card, &r);
+                    let h = create_edit(
+                        parent,
+                        hinst,
+                        &edit_in(&frame, 0),
+                        &s.screenshot_folder,
+                        IDC_EDIT_FOLDER,
+                        body,
+                    );
+                    register(h, page);
+                    let browse = trailing(&card, &r, BROWSE_W, CTRL_H);
+                    let h = create_owner_button(
+                        parent,
+                        hinst,
+                        &browse,
+                        i18n::t("settings.btn.browse"),
+                        IDC_BTN_BROWSE,
+                        button_font,
+                    );
+                    register(h, page);
+                }
+                Row::Key(svc) => {
+                    let frame = key_field(&card, &r);
+                    let edit = create_edit(
+                        parent,
+                        hinst,
+                        &edit_in(&frame, EYE_W),
+                        svc.stored(s),
+                        svc.edit_id(),
+                        body,
+                    );
+                    // Masked until asked: a settings window ends up in
+                    // screenshots and screen shares far more often than
+                    // anyone means it to.
+                    SendMessageW(edit, EM_SETPASSWORDCHAR, WPARAM(MASK_CHAR), LPARAM(0));
+                    register(edit, page);
+                    let eye = create_owner_button(
+                        parent,
+                        hinst,
+                        &eye_rect(&frame),
+                        "",
+                        IDC_EYE + svc.index() as i32,
+                        body,
+                    );
+                    register(eye, page);
+                }
+            }
         }
 
-        // ── General: interface language ──
-        let g = &page.groups[G_GENERAL];
-        let combo = g.trailing(0, VALUE_W, CTRL_H);
-        row_label(
+        // Cancel / Save, bottom right.  The default button goes last.
+        let h = with_geo(|g| g.height);
+        let y = h - FOOTER_PAD - BTN_H;
+        let save = RECT {
+            left: CX1 - BTN_W,
+            top: y,
+            right: CX1,
+            bottom: y + BTN_H,
+        };
+        let cancel = RECT {
+            left: save.left - BTN_GAP - BTN_W,
+            right: save.left - BTN_GAP,
+            ..save
+        };
+        let b = create_owner_button(
             parent,
             hinst,
-            r,
-            g,
-            0,
-            combo.left - 12,
-            i18n::t("settings.label.language"),
-            &mut label_id,
-        );
-        create_lang_combo(
-            parent,
-            hinst,
-            r.font_body(),
-            combo.left,
-            combo.top,
-            VALUE_W,
-            &s.language,
-        );
-
-        // ── Translation: DeepSeek key ──
-        let g = &page.groups[G_TRANSLATION];
-        let field = g.trailing(0, VALUE_W, CTRL_H);
-        row_label(
-            parent,
-            hinst,
-            r,
-            g,
-            0,
-            field.left - 12,
-            i18n::t("settings.label.deepseek_key"),
-            &mut label_id,
-        );
-        create_edit_field(
-            parent,
-            hinst,
-            r.font_body(),
-            field.left,
-            field.top,
-            VALUE_W,
-            CTRL_H,
-            &s.deepseek_api_key,
-            IDC_EDIT_DEEPSEEK,
-        );
-        row_label(
-            parent,
-            hinst,
-            r,
-            g,
-            1,
-            g.card.right - ROW_PAD - VALUE_W,
-            i18n::t("settings.label.key_status"),
-            &mut label_id,
-        );
-        create_label(
-            parent,
-            hinst,
-            r.font_meta(),
-            MARGIN + 2,
-            g.footnote_y.unwrap_or(0),
-            CARD_W - 4,
-            FOOTNOTE_H,
-            i18n::t("settings.hint.deepseek"),
-            IDC_FOOTNOTE,
-            LabelKind::Footnote,
-        );
-
-        // ── Shortcuts ──
-        let g = &page.groups[G_SHORTCUTS];
-        let hotkeys: &[(&str, i32, &HotkeyConfig)] = &[
-            (
-                i18n::t("settings.hotkey.translate"),
-                IDC_HK_TRANSLATE,
-                &s.hk_translate,
-            ),
-            (i18n::t("settings.hotkey.ocr"), IDC_HK_OCR, &s.hk_ocr),
-            (
-                i18n::t("settings.hotkey.screenshot"),
-                IDC_HK_SCREENSHOT,
-                &s.hk_screenshot,
-            ),
-            (
-                i18n::t("settings.hotkey.layout"),
-                IDC_HK_LAYOUT,
-                &s.hk_layout,
-            ),
-            (
-                i18n::t("settings.hotkey.explorer_cmd"),
-                IDC_HK_EXPLORER_CMD,
-                &s.hk_explorer_cmd,
-            ),
-            (i18n::t("settings.hotkey.ask"), IDC_HK_ASK, &s.hk_ask),
-        ];
-        for (i, &(label, id, hk)) in hotkeys.iter().enumerate() {
-            let field = g.trailing(i, VALUE_W, CTRL_H);
-            row_label(
-                parent,
-                hinst,
-                r,
-                g,
-                i,
-                field.left - 12,
-                label,
-                &mut label_id,
-            );
-            create_hotkey_field(
-                parent,
-                hinst,
-                r.font_body(),
-                field.left,
-                field.top,
-                VALUE_W,
-                CTRL_H,
-                id,
-                hk,
-            );
-        }
-
-        // ── Screenshots: folder path + Choose.  The group title already says
-        // what the row is for, so it carries no label of its own. ──
-        let g = &page.groups[G_SCREENSHOTS];
-        let browse = g.trailing(0, BROWSE_W, CTRL_H);
-        let folder_left = g.card.left + ROW_PAD;
-        create_edit_field(
-            parent,
-            hinst,
-            r.font_body(),
-            folder_left,
-            browse.top,
-            browse.left - 10 - folder_left,
-            CTRL_H,
-            &s.screenshot_folder,
-            IDC_EDIT_FOLDER,
-        );
-        create_od_button(
-            parent,
-            hinst,
-            r.font_button(),
-            browse.left,
-            browse.top,
-            BROWSE_W,
-            CTRL_H,
-            i18n::t("settings.btn.browse"),
-            IDC_BTN_BROWSE,
-        );
-
-        // ── Features: one switch per row ──
-        let g = &page.groups[G_FEATURES];
-        let features: &[(&str, i32, bool)] = &[
-            (
-                i18n::t("settings.checkbox.punto"),
-                IDC_CHK_PUNTO,
-                s.punto_enabled,
-            ),
-            (
-                i18n::t("settings.checkbox.taskbar"),
-                IDC_CHK_TASKBAR,
-                s.taskbar_center_enabled,
-            ),
-            (
-                i18n::t("settings.checkbox.autostart"),
-                IDC_CHK_AUTOSTART,
-                autostart::is_enabled(),
-            ),
-            (
-                i18n::t("settings.checkbox.explorer_cmd"),
-                IDC_CHK_EXPLORER_CMD,
-                crate::explorer_cmd::is_menu_enabled(),
-            ),
-        ];
-        for (i, &(label, id, checked)) in features.iter().enumerate() {
-            let sw = g.trailing(i, SWITCH_W, SWITCH_H);
-            row_label(
-                parent,
-                hinst,
-                r,
-                g,
-                i,
-                sw.left - 12,
-                label,
-                &mut label_id,
-            );
-            create_switch(parent, hinst, sw.left, sw.top, id, checked);
-        }
-
-        // ── Cancel / Save, bottom right.  The default button goes last, the
-        // way every macOS sheet puts it. ──
-        let save_x = WIN_W - MARGIN - BTN_W;
-        create_od_button(
-            parent,
-            hinst,
-            r.font_button(),
-            save_x - BTN_GAP - BTN_W,
-            page.buttons_y,
-            BTN_W,
-            BTN_H,
+            &cancel,
             i18n::t("settings.btn.cancel"),
             IDC_BTN_CANCEL,
+            button_font,
         );
-        create_od_button(
+        register(b, ALL_PAGES);
+        let b = create_owner_button(
             parent,
             hinst,
-            r.font_button(),
-            save_x,
-            page.buttons_y,
-            BTN_W,
-            BTN_H,
+            &save,
             i18n::t("settings.btn.save"),
             IDC_BTN_SAVE,
+            button_font,
         );
+        register(b, ALL_PAGES);
     }
 }
 
-/// A row's left-hand label.  Grouped-list labels carry no trailing colon — the
-/// alignment already says the control on the right belongs to them.
-#[allow(clippy::too_many_arguments)]
-unsafe fn row_label(
-    parent: HWND,
-    hinst: HINSTANCE,
-    r: &Resources,
-    g: &Group,
-    row: usize,
-    right: i32,
-    text: &str,
-    next_id: &mut i32,
-) {
+fn register(h: HWND, page: usize) {
+    CONTROLS.lock().unwrap().push((h.0 as isize, page));
+}
+
+unsafe fn show_page(hwnd: HWND, page: usize) {
     unsafe {
-        let rc = g.leading(row, right);
-        create_label(
-            parent,
-            hinst,
-            r.font_body(),
-            rc.left,
-            rc.top,
-            (rc.right - rc.left).max(0),
-            rc.bottom - rc.top,
-            strip_colon(text),
-            *next_id,
-            LabelKind::Row,
-        );
-        *next_id += 1;
-    }
-}
-
-fn strip_colon(s: &str) -> &str {
-    s.trim_end().trim_end_matches([':', '：']).trim_end()
-}
-
-// ============================================================
-// DeepSeek key status
-// ============================================================
-
-/// Kicks off a key check unless the same key was already checked.  Runs on a
-/// worker thread — the models endpoint costs no tokens but does cost a
-/// round-trip, and the settings window must not freeze on it.
-unsafe fn start_key_check(hwnd: HWND, key: &str) {
-    let key = key.trim().to_string();
-
-    if key.is_empty() {
-        *KEY_STATUS.lock().unwrap() = KeyStatus::Unset;
-        KEY_CHECKED.lock().unwrap().clear();
-        unsafe { invalidate_key_status(hwnd) };
-        return;
-    }
-    if *KEY_CHECKED.lock().unwrap() == key {
-        return;
-    }
-
-    *KEY_CHECKED.lock().unwrap() = key.clone();
-    *KEY_STATUS.lock().unwrap() = KeyStatus::Checking;
-    unsafe { invalidate_key_status(hwnd) };
-
-    let target = hwnd.0 as isize;
-    std::thread::spawn(move || {
-        let status = match crate::deepseek::check_key(&key) {
-            crate::deepseek::KeyCheck::Valid => KeyStatus::Valid,
-            crate::deepseek::KeyCheck::Rejected => KeyStatus::Rejected,
-            crate::deepseek::KeyCheck::Unreachable(e) => {
-                println!("[!] DeepSeek key check: {e}");
-                KeyStatus::Unreachable
+        *PAGE.lock().unwrap() = page;
+        // Focus can't stay on a control that's about to disappear.
+        let focus = GetFocus();
+        let controls = CONTROLS.lock().unwrap().clone();
+        for (h, p) in &controls {
+            let h = HWND(*h as *mut _);
+            let visible = *p == page || *p == ALL_PAGES;
+            if !visible && h == focus {
+                let _ = SetFocus(hwnd);
             }
-        };
-        // A key typed after this check started owns the answer, not us.
-        if *KEY_CHECKED.lock().unwrap() != key {
-            return;
+            let _ = ShowWindow(h, if visible { SW_SHOWNA } else { SW_HIDE });
         }
-        *KEY_STATUS.lock().unwrap() = status;
-        unsafe {
-            let hwnd = HWND(target as *mut _);
-            if IsWindow(hwnd).as_bool() {
-                let _ = PostMessageW(hwnd, WM_APP_KEY_STATUS, WPARAM(0), LPARAM(0));
-            }
-        }
-    });
-}
-
-/// The status value is parent-painted (a coloured dot plus a word), so it has
-/// no control of its own to invalidate.
-unsafe fn invalidate_key_status(hwnd: HWND) {
-    unsafe {
-        let g = &page().groups[G_TRANSLATION];
-        let rc = RECT {
-            left: g.card.left + layout::ROW_PAD,
-            top: g.row_top(1),
-            right: g.card.right,
-            bottom: g.row_top(1) + layout::ROW_H,
-        };
-        let _ = InvalidateRect(hwnd, Some(&rc), false);
+        let _ = InvalidateRect(hwnd, None, false);
     }
 }
 
-fn key_status_text() -> (&'static str, u32) {
-    match *KEY_STATUS.lock().unwrap() {
-        KeyStatus::Unset => ("settings.key.unset", theme::CLR_TEXT_DIM),
-        KeyStatus::Checking => ("settings.key.checking", theme::CLR_TEXT_DIM),
-        KeyStatus::Valid => ("settings.key.valid", CLR_GREEN),
-        KeyStatus::Rejected => ("settings.key.rejected", CLR_RED),
-        KeyStatus::Unreachable => ("settings.key.offline", CLR_ORANGE),
-    }
-}
-
-/// Draws the status row's value: a dot in the state's colour, then the word.
-/// Right-aligned to the same edge every other control in the card lines up on.
-unsafe fn draw_key_status(hdc: HDC) {
-    unsafe {
-        use layout::*;
-        let (key, color) = key_status_text();
-        let text = i18n::t(key);
-
-        let g = &page().groups[G_TRANSLATION];
-        let cy = g.row_top(1) + ROW_H / 2;
-        let right = g.card.right - ROW_PAD;
-
-        let r_guard = res();
-        let r = r_guard.as_ref().unwrap();
-        let old_font = SelectObject(hdc, r.font_body());
-
-        let mut wide = to_wide(text);
-        if wide.last() == Some(&0) {
-            wide.pop();
-        }
-        let mut size = SIZE::default();
-        let _ = GetTextExtentPoint32W(hdc, &wide, &mut size);
-
-        SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, COLORREF(color));
-        let mut trc = RECT {
-            left: right - size.cx,
-            top: cy - size.cy / 2,
-            right,
-            bottom: cy + size.cy / 2 + 1,
-        };
-        DrawTextW(hdc, &mut wide, &mut trc, DRAW_TEXT_FORMAT(0x0820));
-        SelectObject(hdc, old_font);
-        drop(r_guard);
-
-        const DOT: i32 = 8;
-        let dot_right = trc.left - 8;
-        paint::round_rect(
-            hdc,
-            &RECT {
-                left: dot_right - DOT,
-                top: cy - DOT / 2,
-                right: dot_right,
-                bottom: cy - DOT / 2 + DOT,
-            },
-            &paint::Style::flat(DOT / 2, color),
-        );
-    }
-}
-
-
-// ── Reusable control-creation helpers ──
-
-/// What a piece of static text is, which decides its colour and what it sits
-/// on — the only thing `WM_CTLCOLORSTATIC` gets to work with is the control id.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum LabelKind {
-    /// Sits on a card, next to its control.
-    Row,
-    /// Secondary-colour title above a card.
-    GroupTitle,
-    /// Explanatory line under a card, on the window background.
-    Footnote,
-}
-
-#[allow(clippy::too_many_arguments)]
-unsafe fn create_label(
+unsafe fn create_edit(
     parent: HWND,
     hinst: HINSTANCE,
-    font: HFONT,
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
-    text: &str,
-    id: i32,
-    kind: LabelKind,
-) {
-    unsafe {
-        let class = to_wide("STATIC");
-        let wide = to_wide(text);
-        // Row labels are single lines centred against a taller row; footnotes
-        // wrap and start at the top.
-        let style = if kind == LabelKind::Footnote {
-            WS_CHILD | WS_VISIBLE
-        } else {
-            WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE | SS_ENDELLIPSIS
-        };
-        let ctrl = CreateWindowExW(
-            WINDOW_EX_STYLE(0),
-            PCWSTR(class.as_ptr()),
-            PCWSTR(wide.as_ptr()),
-            style,
-            x,
-            y,
-            w,
-            h,
-            parent,
-            HMENU(id as *mut _),
-            hinst,
-            None,
-        )
-        .unwrap_or_default();
-        let _ = SendMessageW(ctrl, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
-    }
-}
-
-/// A switch is a plain owner-drawn button sized to the track, so it never
-/// overlaps the card's rounded corners the way a full-row control would.
-unsafe fn create_switch(parent: HWND, hinst: HINSTANCE, x: i32, y: i32, id: i32, on: bool) {
-    unsafe {
-        let class = to_wide("BUTTON");
-        // BS_OWNERDRAW → parent paints in WM_DRAWITEM.  The auto-toggle that
-        // BS_AUTOCHECKBOX provides is gone with it, so the state lives in
-        // GWLP_USERDATA and we flip it ourselves on BN_CLICKED.
-        let ctrl = CreateWindowExW(
-            WINDOW_EX_STYLE(0),
-            PCWSTR(class.as_ptr()),
-            PCWSTR(std::ptr::null()),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-            x,
-            y,
-            layout::SWITCH_W,
-            layout::SWITCH_H,
-            parent,
-            HMENU(id as *mut _),
-            hinst,
-            None,
-        )
-        .unwrap_or_default();
-        SetWindowLongPtrW(ctrl, GWLP_USERDATA, if on { 1 } else { 0 });
-    }
-}
-
-unsafe fn create_edit_field(
-    parent: HWND,
-    hinst: HINSTANCE,
-    font: HFONT,
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
+    rc: &RECT,
     initial: &str,
     id: i32,
-) {
+    font: HFONT,
+) -> HWND {
     unsafe {
-        let class = to_wide("EDIT");
         let initial_wide = to_wide(initial);
         let edit = CreateWindowExW(
             WINDOW_EX_STYLE(0),
-            PCWSTR(class.as_ptr()),
+            w!("EDIT"),
             PCWSTR(initial_wide.as_ptr()),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-            x,
-            y,
-            w,
-            h,
+            WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL,
+            rc.left,
+            rc.top,
+            rc.right - rc.left,
+            rc.bottom - rc.top,
             parent,
             HMENU(id as *mut _),
             hinst,
             None,
         )
         .unwrap_or_default();
-        let _ = SendMessageW(edit, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
-        // Internal padding so text doesn't touch edges.
-        let _ = SendMessageW(edit, EM_SETMARGINS, WPARAM(3), LPARAM(8 | (8 << 16)));
+        SendMessageW(edit, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+        edit
     }
+}
+
+/// An owner-drawn button: push buttons, switches and the show/hide toggles
+/// are all this, and `WM_DRAWITEM` tells them apart by id.  Subclassed so it
+/// knows when the pointer is over it — plain `BS_OWNERDRAW` never reports
+/// hover.
+unsafe fn create_owner_button(
+    parent: HWND,
+    hinst: HINSTANCE,
+    rc: &RECT,
+    text: &str,
+    id: i32,
+    font: HFONT,
+) -> HWND {
+    unsafe {
+        let wide = to_wide(text);
+        let ctrl = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("BUTTON"),
+            PCWSTR(wide.as_ptr()),
+            WS_CHILD | WS_TABSTOP | BS_OWNERDRAW,
+            rc.left,
+            rc.top,
+            rc.right - rc.left,
+            rc.bottom - rc.top,
+            parent,
+            HMENU(id as *mut _),
+            hinst,
+            None,
+        )
+        .unwrap_or_default();
+        SendMessageW(ctrl, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+        let prev = SetWindowLongPtrW(ctrl, GWLP_WNDPROC, button_hover_proc as *const () as isize);
+        let mut orig = BUTTON_PROC.lock().unwrap();
+        if *orig == 0 {
+            *orig = prev;
+        }
+        ctrl
+    }
+}
+
+unsafe extern "system" fn button_hover_proc(
+    hwnd: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+) -> LRESULT {
+    unsafe {
+        match msg {
+            WM_MOUSEMOVE => {
+                let prev = std::mem::replace(&mut *HOT_BUTTON.lock().unwrap(), hwnd.0 as isize);
+                if prev != hwnd.0 as isize {
+                    if prev != 0 {
+                        let _ = InvalidateRect(HWND(prev as *mut _), None, false);
+                    }
+                    let _ = InvalidateRect(hwnd, None, false);
+                    let mut tme = TRACKMOUSEEVENT {
+                        cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: hwnd,
+                        dwHoverTime: 0,
+                    };
+                    let _ = TrackMouseEvent(&mut tme);
+                }
+            }
+            WM_MOUSELEAVE => {
+                let mut hot = HOT_BUTTON.lock().unwrap();
+                if *hot == hwnd.0 as isize {
+                    *hot = 0;
+                    drop(hot);
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
+            }
+            // The owner draw covers every pixel; letting the class erase
+            // first is what makes owner-drawn buttons flicker.
+            WM_ERASEBKGND => return LRESULT(1),
+            _ => {}
+        }
+        let orig = *BUTTON_PROC.lock().unwrap();
+        let orig: WNDPROC = std::mem::transmute(orig);
+        CallWindowProcW(orig, hwnd, msg, wp, lp)
+    }
+}
+
+fn is_hot(hwnd: HWND) -> bool {
+    *HOT_BUTTON.lock().unwrap() == hwnd.0 as isize
 }
 
 unsafe fn create_hotkey_field(
     parent: HWND,
     hinst: HINSTANCE,
-    _font: HFONT,
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
+    rc: &RECT,
     id: i32,
     current: &HotkeyConfig,
-) {
+) -> HWND {
     unsafe {
-        register_hotkey_class(hinst);
+        register_class(hinst, w!("ScrTransHotkey"), hotkey_proc, IDC_IBEAM);
         let ctrl = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             w!("ScrTransHotkey"),
-            PCWSTR(std::ptr::null()),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-            x,
-            y,
-            w,
-            h,
+            PCWSTR::null(),
+            WS_CHILD | WS_TABSTOP,
+            rc.left,
+            rc.top,
+            rc.right - rc.left,
+            rc.bottom - rc.top,
             parent,
             HMENU(id as *mut _),
             hinst,
@@ -1003,72 +1156,22 @@ unsafe fn create_hotkey_field(
             focused: false,
         }));
         SetWindowLongPtrW(ctrl, GWLP_USERDATA, state as isize);
+        ctrl
     }
 }
 
-unsafe fn create_od_button(
-    parent: HWND,
-    hinst: HINSTANCE,
-    font: HFONT,
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
-    text: &str,
-    id: i32,
-) {
+unsafe fn create_lang_combo(parent: HWND, hinst: HINSTANCE, rc: &RECT, current_code: &str) -> HWND {
     unsafe {
-        let class = to_wide("BUTTON");
-        let wide = to_wide(text);
-        let ctrl = CreateWindowExW(
-            WINDOW_EX_STYLE(0),
-            PCWSTR(class.as_ptr()),
-            PCWSTR(wide.as_ptr()),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-            x,
-            y,
-            w,
-            h,
-            parent,
-            HMENU(id as *mut _),
-            hinst,
-            None,
-        )
-        .unwrap_or_default();
-        let _ = SendMessageW(ctrl, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
-    }
-}
-
-fn is_checkbox_id(id: i32) -> bool {
-    matches!(
-        id,
-        IDC_CHK_PUNTO
-            | IDC_CHK_TASKBAR
-            | IDC_CHK_AUTOSTART
-            | IDC_CHK_EXPLORER_CMD
-    )
-}
-
-unsafe fn create_lang_combo(
-    parent: HWND,
-    hinst: HINSTANCE,
-    _font: HFONT,
-    x: i32,
-    y: i32,
-    w: i32,
-    current_code: &str,
-) {
-    unsafe {
-        register_lang_class(hinst);
+        register_class(hinst, w!("ScrTransLangCombo"), lang_proc, IDC_HAND);
         let ctrl = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             w!("ScrTransLangCombo"),
-            PCWSTR(std::ptr::null()),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-            x,
-            y,
-            w,
-            layout::CTRL_H,
+            PCWSTR::null(),
+            WS_CHILD | WS_TABSTOP,
+            rc.left,
+            rc.top,
+            rc.right - rc.left,
+            rc.bottom - rc.top,
             parent,
             HMENU(IDC_COMBO_LANG as *mut _),
             hinst,
@@ -1086,6 +1189,47 @@ unsafe fn create_lang_combo(
             popup: 0,
         }));
         SetWindowLongPtrW(ctrl, GWLP_USERDATA, state as isize);
+        ctrl
+    }
+}
+
+/// Registers a window class once per process; later calls are no-ops that
+/// fail harmlessly.
+unsafe fn register_class(
+    hinst: HINSTANCE,
+    name: PCWSTR,
+    proc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+    cursor: PCWSTR,
+) {
+    unsafe {
+        let wc = WNDCLASSW {
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(proc),
+            hInstance: hinst,
+            hCursor: LoadCursorW(None, cursor).unwrap_or_default(),
+            hbrBackground: HBRUSH(std::ptr::null_mut()),
+            lpszClassName: name,
+            ..Default::default()
+        };
+        RegisterClassW(&wc);
+    }
+}
+
+/// `WM_GETDLGCODE` for the custom controls: every key but Tab (and Escape,
+/// unless `keep_escape`), so `IsDialogMessage` still moves focus on Tab and
+/// closes the window on Escape.
+unsafe fn dlg_code(lp: LPARAM, keep_escape: bool) -> LRESULT {
+    unsafe {
+        let m = lp.0 as *const MSG;
+        if !m.is_null() {
+            let m = &*m;
+            if m.message == WM_KEYDOWN
+                && (m.wParam.0 == 0x09 || (m.wParam.0 == 0x1B && !keep_escape))
+            {
+                return LRESULT(0);
+            }
+        }
+        LRESULT(DLGC_WANTARROWS | DLGC_WANTALLKEYS | DLGC_WANTCHARS)
     }
 }
 
@@ -1096,8 +1240,7 @@ unsafe fn create_lang_combo(
 unsafe fn read_hotkey(parent: HWND, id: i32) -> HotkeyConfig {
     unsafe {
         let ctrl = GetDlgItem(parent, id).unwrap_or_default();
-        let r = SendMessageW(ctrl, HK_MSG_GET, WPARAM(0), LPARAM(0));
-        let packed = r.0 as u32;
+        let packed = SendMessageW(ctrl, HK_MSG_GET, WPARAM(0), LPARAM(0)).0 as u32;
         HotkeyConfig {
             vk: packed & 0xFFFF,
             modifiers: packed >> 16,
@@ -1105,14 +1248,8 @@ unsafe fn read_hotkey(parent: HWND, id: i32) -> HotkeyConfig {
     }
 }
 
-unsafe fn read_folder(parent: HWND) -> String {
-    unsafe { read_edit_text(parent, IDC_EDIT_FOLDER) }
-}
-
-unsafe fn read_deepseek_key(parent: HWND) -> String {
-    unsafe { read_edit_text(parent, IDC_EDIT_DEEPSEEK) }
-}
-
+/// The text of an edit — masked or not, `GetWindowText` returns what was
+/// typed, since the control belongs to this process.
 unsafe fn read_edit_text(parent: HWND, id: i32) -> String {
     unsafe {
         let ctrl = GetDlgItem(parent, id).unwrap_or_default();
@@ -1126,7 +1263,7 @@ unsafe fn read_edit_text(parent: HWND, id: i32) -> String {
     }
 }
 
-unsafe fn read_checkbox(parent: HWND, id: i32) -> bool {
+unsafe fn read_switch(parent: HWND, id: i32) -> bool {
     unsafe {
         let ctrl = GetDlgItem(parent, id).unwrap_or_default();
         GetWindowLongPtrW(ctrl, GWLP_USERDATA) != 0
@@ -1144,6 +1281,103 @@ unsafe fn read_selected_language(parent: HWND) -> String {
     }
 }
 
+unsafe fn do_save(hwnd: HWND) {
+    unsafe {
+        let key = |svc: Service| read_edit_text(hwnd, svc.edit_id()).trim().to_string();
+        let current = settings::current();
+        let new_settings = Settings {
+            hk_translate: read_hotkey(hwnd, IDC_HK_TRANSLATE),
+            hk_ocr: read_hotkey(hwnd, IDC_HK_OCR),
+            hk_screenshot: read_hotkey(hwnd, IDC_HK_SCREENSHOT),
+            hk_layout: read_hotkey(hwnd, IDC_HK_LAYOUT),
+            hk_explorer_cmd: read_hotkey(hwnd, IDC_HK_EXPLORER_CMD),
+            hk_ask: read_hotkey(hwnd, IDC_HK_ASK),
+            screenshot_folder: read_edit_text(hwnd, IDC_EDIT_FOLDER),
+            punto_enabled: read_switch(hwnd, IDC_CHK_PUNTO),
+            taskbar_center_enabled: read_switch(hwnd, IDC_CHK_TASKBAR),
+            language: read_selected_language(hwnd),
+            deepseek_api_key: key(Service::DeepSeek),
+            gemini_api_key: key(Service::Gemini),
+            search_api_key: key(Service::Tavily),
+            // Carried through untouched: this one is toggled from the ask
+            // window, and saving here must not quietly reset it.
+            web_search: current.web_search,
+            ask_enabled: read_switch(hwnd, IDC_CHK_ASK),
+        };
+
+        // Side-channel toggles (registry / context menu).
+        autostart::set_enabled(read_switch(hwnd, IDC_CHK_AUTOSTART));
+        crate::explorer_cmd::set_menu_enabled(read_switch(hwnd, IDC_CHK_EXPLORER_CMD));
+
+        settings::save(&new_settings);
+        *UPDATED_SETTINGS.lock().unwrap() = Some(Box::new(new_settings));
+        let _ = DestroyWindow(hwnd);
+    }
+}
+
+// ============================================================
+// Key checks
+// ============================================================
+
+/// Kicks off a check of `key` unless it's the one already checked.  Runs on a
+/// worker thread — no endpoint used costs quota, but each costs a round-trip,
+/// and the window must not freeze on it.
+fn start_key_check(svc: Service, key: &str) {
+    let key = key.trim().to_string();
+    let slot = &KEY_SLOTS[svc.index()];
+
+    if key.is_empty() {
+        *slot.status.lock().unwrap() = KeyStatus::Unset;
+        slot.checked.lock().unwrap().clear();
+        post_key_status(svc);
+        return;
+    }
+    {
+        let mut checked = slot.checked.lock().unwrap();
+        if *checked == key && *slot.status.lock().unwrap() != KeyStatus::Unset {
+            return;
+        }
+        *checked = key.clone();
+    }
+    *slot.status.lock().unwrap() = KeyStatus::Checking;
+    post_key_status(svc);
+
+    std::thread::spawn(move || {
+        let status = svc.check(&key);
+        // A key typed after this check started owns the answer, not us.
+        if *slot.checked.lock().unwrap() != key {
+            return;
+        }
+        *slot.status.lock().unwrap() = status;
+        post_key_status(svc);
+    });
+}
+
+/// Tells whichever settings window is open *now* to repaint a status — the
+/// check may outlive the window that started it, and a reopened window must
+/// still hear the answer.
+fn post_key_status(svc: Service) {
+    if let Some(hwnd) = settings_hwnd() {
+        unsafe {
+            let _ = PostMessageW(hwnd, WM_APP_KEY_STATUS, WPARAM(svc.index()), LPARAM(0));
+        }
+    }
+}
+
+fn status_look(svc: Service) -> (&'static str, u32) {
+    match *KEY_SLOTS[svc.index()].status.lock().unwrap() {
+        KeyStatus::Unset => (i18n::t("settings.key.unset"), theme::CLR_HINT),
+        KeyStatus::Checking => (i18n::t("settings.key.checking"), theme::CLR_TEXT_DIM),
+        KeyStatus::Valid => (i18n::t("settings.key.valid"), theme::CLR_GREEN),
+        KeyStatus::Rejected => (i18n::t("settings.key.rejected"), theme::CLR_RED),
+        KeyStatus::Unreachable => (i18n::t(svc.offline()), theme::CLR_ORANGE),
+    }
+}
+
+// ============================================================
+// Folder picker
+// ============================================================
+
 /// Shows the native pick-folder dialog on a dedicated STA worker thread.
 ///
 /// Why the indirection: `IFileOpenDialog` is a UI component that requires
@@ -1153,9 +1387,7 @@ unsafe fn read_selected_language(parent: HWND) -> String {
 ///
 /// We spawn an STA thread, let it run the dialog (which internally pumps
 /// its own message loop), and post the chosen path back via a custom
-/// `WM_APP_BROWSE_RESULT` message.  The main-thread handler updates the
-/// edit field.  The Settings window stays responsive the whole time
-/// because Windows auto-disables the parent while a modal child exists.
+/// `WM_APP_BROWSE_RESULT` message.
 unsafe fn browse_folder(parent: HWND) {
     let parent_isize = parent.0 as isize;
 
@@ -1186,8 +1418,6 @@ unsafe fn browse_folder(parent: HWND) {
             })();
 
             if let Some(path) = picked {
-                // Hand the string back via a heap-allocated Box.  Handler
-                // on the main thread takes ownership and frees it.
                 let boxed: *mut String = Box::into_raw(Box::new(path));
                 let parent_hwnd = HWND(parent_isize as *mut _);
                 if PostMessageW(
@@ -1225,7 +1455,7 @@ unsafe fn apply_browse_result(hwnd: HWND, lp: LPARAM) {
 }
 
 // ============================================================
-// Owner-drawn button painting (hover-aware)
+// Owner-drawn buttons: push buttons, switches, show/hide toggles
 // ============================================================
 
 #[repr(C)]
@@ -1241,206 +1471,506 @@ struct DrawItemStruct {
     item_data: usize,
 }
 
-unsafe fn draw_owner_button(lp: LPARAM) {
+/// A focus ring is only drawn once the keyboard has been used — Windows
+/// sets `ODS_NOFOCUSRECT` until then, so a mouse click doesn't leave one.
+fn keyboard_focus(dis: &DrawItemStruct) -> bool {
+    dis.item_state & ODS_FOCUS != 0 && dis.item_state & ODS_NOFOCUSRECT == 0
+}
+
+/// Everything an owner-drawn control paints goes through one off-screen
+/// buffer, so hover changes never flash.
+unsafe fn buffered(dis: &DrawItemStruct, draw: impl FnOnce(HDC, &RECT)) {
+    unsafe {
+        let rc = dis.rc_item;
+        let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+        let mem = CreateCompatibleDC(dis.hdc);
+        let bmp = CreateCompatibleBitmap(dis.hdc, w, h);
+        let old = SelectObject(mem, bmp);
+        let local = RECT {
+            left: 0,
+            top: 0,
+            right: w,
+            bottom: h,
+        };
+        draw(mem, &local);
+        let _ = BitBlt(dis.hdc, rc.left, rc.top, w, h, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, old);
+        let _ = DeleteObject(bmp);
+        let _ = DeleteDC(mem);
+    }
+}
+
+unsafe fn draw_item(lp: LPARAM) {
     unsafe {
         let dis = &*(lp.0 as *const DrawItemStruct);
-        let hdc = dis.hdc;
-        let rc = dis.rc_item;
         let id = dis.ctl_id as i32;
+        if is_switch_id(id) {
+            draw_switch(dis);
+        } else if is_eye_id(id) {
+            draw_eye(dis);
+        } else {
+            draw_push_button(dis, id);
+        }
+    }
+}
 
-        // Item-state flags set by the BS_OWNERDRAW protocol.
-        //   ODS_SELECTED (0x0001) = pressed
-        //   ODS_FOCUS    (0x0010) = keyboard focus
-        //   ODS_HOTLIGHT (0x0040) = mouse hover (best-effort from the theme)
-        let is_pressed = dis.item_state & 0x0001 != 0;
-        let is_hover = dis.item_state & 0x0040 != 0;
-        let state = if is_pressed {
+unsafe fn draw_push_button(dis: &DrawItemStruct, id: i32) {
+    unsafe {
+        let state = if dis.item_state & ODS_SELECTED != 0 {
             button::State::Pressed
-        } else if is_hover {
+        } else if is_hot(dis.hwnd_item) {
             button::State::Hover
         } else {
             button::State::Normal
         };
-
-        // Save is the default button — the one Return activates.
         let variant = if id == IDC_BTN_SAVE {
             button::Variant::Primary
         } else {
             button::Variant::Secondary
         };
+        // What shows through the rounded corners: the browse button sits on
+        // a card, the footer buttons on the window.
+        let behind = if id == IDC_BTN_BROWSE {
+            theme::CLR_CARD
+        } else {
+            theme::CLR_BG
+        };
+        let focus = keyboard_focus(dis);
 
-        // The control's own background shows through the rounded corners, so
-        // clear it before the body goes down.
-        let r_guard = res();
-        let r = r_guard.as_ref().unwrap();
-        let _ = FillRect(hdc, &rc, r.bg_brush());
-
-        button::draw(hdc, &rc, theme::CLR_ACCENT, variant, state);
-
-        // Text.
-        let old_font = SelectObject(hdc, r.font_button());
-        SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, COLORREF(button::text_color(variant, state)));
-
-        let mut buf = vec![0u16; 64];
+        let mut buf = [0u16; 64];
         let len = GetWindowTextW(dis.hwnd_item, &mut buf) as usize;
-        let mut text: Vec<u16> = buf[..len].to_vec();
-        let mut trc = rc;
-        // DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX
-        DrawTextW(hdc, &mut text, &mut trc, DRAW_TEXT_FORMAT(0x0825));
-        SelectObject(hdc, old_font);
-    }
-}
+        let label = String::from_utf16_lossy(&buf[..len]);
 
-/// Paints a macOS-style switch: a pill track with a white knob that sits at
-/// one end or the other.  The state lives in `GWLP_USERDATA` because
-/// `BS_OWNERDRAW` disables the auto-toggle a real checkbox would have.
-unsafe fn draw_owner_switch(dis: &DrawItemStruct) {
-    unsafe {
-        use layout::*;
-        let hdc = dis.hdc;
-        let rc = dis.rc_item;
-        let on = GetWindowLongPtrW(dis.hwnd_item, GWLP_USERDATA) != 0;
-        let hover = dis.item_state & 0x0040 != 0;
-        let pressed = dis.item_state & 0x0001 != 0;
-
-        // The switch sits on a card, so that is what shows through its
-        // rounded ends.
-        let r_guard = res();
-        let _ = FillRect(hdc, &rc, r_guard.as_ref().unwrap().card_brush());
-        drop(r_guard);
-
-        let accent = theme::CLR_ACCENT;
-        let (top, bottom, border) = if on {
-            (lighten(accent, 14), accent, darken(accent, 28))
-        } else {
-            (
-                theme::CLR_CTRL_TOP,
-                theme::CLR_CTRL_BOTTOM,
-                theme::CLR_CTRL_BORDER,
-            )
-        };
-        let shift: i32 = if pressed {
-            -14
-        } else if hover {
-            10
-        } else {
-            0
-        };
-        let adjust = |c: u32| {
-            if shift < 0 {
-                darken(c, shift.unsigned_abs())
-            } else {
-                lighten(c, shift as u32)
+        buffered(dis, |hdc, rc| {
+            fill(hdc, rc, behind);
+            let fill_c = button::fill(theme::CLR_ACCENT, variant, state);
+            let mut style =
+                paint::Style::flat(button::radius(rc.bottom - rc.top), fill_c);
+            if focus {
+                style = style
+                    .border(lighten(theme::CLR_ACCENT, 60))
+                    .border_width(2);
             }
-        };
+            paint::round_rect(hdc, rc, &style);
+            theme::text(
+                hdc,
+                &label,
+                rc,
+                theme::ui_font(FONT_BODY, 500),
+                button::text_color(variant, state),
+                theme::DT_CENTER_VCENTER,
+            );
+        });
+    }
+}
 
-        let track = paint::Style::flat(SWITCH_H / 2, top)
-            .gradient(adjust(top), adjust(bottom))
-            .border(adjust(border));
-        paint::round_rect(hdc, &rc, &track);
+/// A pill track with a white knob at one end or the other.  The state lives
+/// in `GWLP_USERDATA`, because `BS_OWNERDRAW` has no check state of its own.
+unsafe fn draw_switch(dis: &DrawItemStruct) {
+    unsafe {
+        let on = GetWindowLongPtrW(dis.hwnd_item, GWLP_USERDATA) != 0;
+        let hot = is_hot(dis.hwnd_item);
+        let pressed = dis.item_state & ODS_SELECTED != 0;
+        let focus = keyboard_focus(dis);
 
-        // Knob: a circle inset from the track, plus one row for its shadow.
-        let d = SWITCH_H - 6;
-        let x = if on { rc.right - 3 - d } else { rc.left + 3 };
-        let knob_rc = RECT {
-            left: x,
-            top: rc.top + 3,
-            right: x + d,
-            bottom: rc.top + 3 + d + 1,
-        };
-        let knob = paint::Style::flat(d / 2, 0x00FF_FFFF)
-            .gradient(0x00FF_FFFF, 0x00F0_F0F0)
-            .shadow(theme::CLR_SHADOW);
-        paint::round_rect(hdc, &knob_rc, &knob);
+        buffered(dis, |hdc, rc| {
+            fill(hdc, rc, theme::CLR_CARD);
+            let base = if on { theme::CLR_ACCENT } else { theme::CLR_CTRL };
+            let track = if pressed {
+                theme::darken(base, 14)
+            } else if hot {
+                lighten(base, 14)
+            } else {
+                base
+            };
+            let h = rc.bottom - rc.top;
+            let mut style = paint::Style::flat(h / 2, track);
+            if focus {
+                style = style.border(lighten(theme::CLR_ACCENT, 60)).border_width(2);
+            }
+            paint::round_rect(hdc, rc, &style);
+
+            let r = h / 2 - 3;
+            let cx = if on { rc.right - 3 - r } else { rc.left + 3 + r };
+            paint::circle(hdc, cx, rc.top + h / 2, r, 0x00FF_FFFF);
+        });
+    }
+}
+
+/// The show/hide toggle inside a key field: an eye, struck through while
+/// the key is masked.
+unsafe fn draw_eye(dis: &DrawItemStruct) {
+    unsafe {
+        let shown = GetWindowLongPtrW(dis.hwnd_item, GWLP_USERDATA) != 0;
+        let hot = is_hot(dis.hwnd_item);
+        let focus = keyboard_focus(dis);
+        buffered(dis, |hdc, rc| {
+            fill(hdc, rc, theme::CLR_FIELD);
+            if hot || focus {
+                let mut style = paint::Style::flat(5, lighten(theme::CLR_FIELD, 14));
+                if focus {
+                    style = style.border(theme::CLR_ACCENT);
+                }
+                paint::round_rect(hdc, rc, &style);
+            }
+            let color = if shown {
+                theme::CLR_ACCENT
+            } else if hot {
+                theme::CLR_TEXT_BRIGHT
+            } else {
+                theme::CLR_TEXT_DIM
+            };
+            theme::glyph(hdc, theme::ICON_EYE, rc, 15, color);
+            if !shown {
+                let cx = (rc.right - rc.left) as f32 / 2.0;
+                let cy = (rc.bottom - rc.top) as f32 / 2.0;
+                // The strike needs a gap cut either side of it to read as a
+                // slash rather than part of the eye.
+                let bg = if hot || focus {
+                    lighten(theme::CLR_FIELD, 14)
+                } else {
+                    theme::CLR_FIELD
+                };
+                let pts = [(cx - 7.0, cy - 7.0), (cx + 7.0, cy + 7.0)];
+                paint::polyline(hdc, rc, &pts, 3.6, bg);
+                paint::polyline(hdc, rc, &pts, 1.4, color);
+            }
+        });
+    }
+}
+
+unsafe fn fill(hdc: HDC, rc: &RECT, color: u32) {
+    unsafe {
+        let b = CreateSolidBrush(COLORREF(color));
+        let _ = FillRect(hdc, rc, b);
+        let _ = DeleteObject(b);
+    }
+}
+
+unsafe fn toggle_eye(hwnd: HWND, eye: HWND, id: i32) {
+    unsafe {
+        let shown = GetWindowLongPtrW(eye, GWLP_USERDATA) == 0;
+        SetWindowLongPtrW(eye, GWLP_USERDATA, shown as isize);
+        let svc = Service::ALL[(id - IDC_EYE) as usize];
+        let edit = GetDlgItem(hwnd, svc.edit_id()).unwrap_or_default();
+        let ch = if shown { 0 } else { MASK_CHAR };
+        SendMessageW(edit, EM_SETPASSWORDCHAR, WPARAM(ch), LPARAM(0));
+        let _ = InvalidateRect(edit, None, true);
+        let _ = InvalidateRect(eye, None, false);
     }
 }
 
 // ============================================================
-// WM_PAINT — grouped cards, row hairlines, field frames
+// WM_PAINT — sidebar, heading, cards, labels, field frames
 // ============================================================
-
-/// Native EDIT controls the parent draws a rounded frame around.  The hotkey
-/// fields and the language combo are custom classes that paint their own.
-fn input_rects() -> Vec<(i32, RECT)> {
-    use layout::*;
-    let page = page();
-    let deepseek = page.groups[G_TRANSLATION].trailing(0, VALUE_W, CTRL_H);
-    let browse = page.groups[G_SCREENSHOTS].trailing(0, BROWSE_W, CTRL_H);
-    let folder_left = page.groups[G_SCREENSHOTS].card.left + ROW_PAD;
-    vec![
-        (IDC_EDIT_DEEPSEEK, deepseek),
-        (
-            IDC_EDIT_FOLDER,
-            RECT {
-                left: folder_left,
-                top: browse.top,
-                right: browse.left - 10,
-                bottom: browse.bottom,
-            },
-        ),
-    ]
-}
-
-/// A field's frame is drawn just outside the control, so the child's own
-/// rectangular fill never shows a square corner.
-fn field_frame(rc: &RECT) -> RECT {
-    RECT {
-        left: rc.left - 3,
-        top: rc.top - 3,
-        right: rc.right + 3,
-        bottom: rc.bottom + 3,
-    }
-}
 
 unsafe fn paint(hwnd: HWND) {
     unsafe {
-        use layout::*;
-
         let mut ps = PAINTSTRUCT::default();
         let hdc = BeginPaint(hwnd, &mut ps);
-        let page = page();
+        let mut client = RECT::default();
+        let _ = GetClientRect(hwnd, &mut client);
+        let (w, h) = (client.right, client.bottom);
 
-        // Grouped cards, the way macOS lays out a settings pane: content on a
-        // slightly raised surface, hairlines between rows indented past the
-        // left padding so the group reads as one block rather than a table.
-        let card_style = paint::Style::flat(CARD_R, theme::CLR_CARD).border(theme::CLR_SEPARATOR);
-        for g in &page.groups {
-            paint::round_rect(hdc, &g.card, &card_style);
-            for i in 1..g.rows {
-                paint::hairline(
-                    hdc,
-                    g.card.left + ROW_PAD,
-                    g.card.right,
-                    g.row_top(i),
-                    theme::CLR_SEPARATOR,
-                );
+        let mem = CreateCompatibleDC(hdc);
+        let bmp = CreateCompatibleBitmap(hdc, w, h);
+        let old = SelectObject(mem, bmp);
+
+        paint_scene(mem, &client, &ps.rcPaint);
+
+        let dirty = ps.rcPaint;
+        let _ = BitBlt(
+            hdc,
+            dirty.left,
+            dirty.top,
+            dirty.right - dirty.left,
+            dirty.bottom - dirty.top,
+            mem,
+            dirty.left,
+            dirty.top,
+            SRCCOPY,
+        );
+        SelectObject(mem, old);
+        let _ = DeleteObject(bmp);
+        let _ = DeleteDC(mem);
+        let _ = EndPaint(hwnd, &ps);
+    }
+}
+
+unsafe fn paint_scene(hdc: HDC, client: &RECT, dirty: &RECT) {
+    unsafe {
+        use layout::*;
+        let page = current_page();
+        let hover = *HOVER.lock().unwrap();
+
+        // ── Background: navigation column and content ──
+        fill(hdc, client, theme::CLR_BG);
+        let sidebar = RECT {
+            right: SIDEBAR_W,
+            ..*client
+        };
+        fill(hdc, &sidebar, theme::CLR_SIDEBAR);
+        paint::hairline(
+            hdc,
+            SIDEBAR_W - 1,
+            SIDEBAR_W,
+            0,
+            theme::mix(theme::CLR_SIDEBAR, theme::CLR_SEPARATOR, 160),
+        );
+        let edge = RECT {
+            left: SIDEBAR_W - 1,
+            top: 0,
+            right: SIDEBAR_W,
+            bottom: client.bottom,
+        };
+        fill(hdc, &edge, theme::mix(theme::CLR_SIDEBAR, theme::CLR_SEPARATOR, 160));
+
+        // ── App mark and name ──
+        let mark = RECT {
+            left: 20,
+            top: 20,
+            right: 46,
+            bottom: 46,
+        };
+        paint::round_rect(hdc, &mark, &paint::Style::flat(7, theme::CLR_ACCENT));
+        theme::glyph(hdc, theme::ICON_TRANSLATE, &mark, 15, 0x00FF_FFFF);
+        theme::text(
+            hdc,
+            "Screen Translator",
+            &RECT {
+                left: 56,
+                top: 18,
+                right: SIDEBAR_W - 12,
+                bottom: 48,
+            },
+            theme::ui_font(FONT_BODY, 600),
+            theme::CLR_TEXT_BRIGHT,
+            theme::DT_LEFT_VCENTER | theme::DT_ELLIPSIS,
+        );
+
+        // ── Navigation ──
+        for (i, p) in PAGES.iter().enumerate() {
+            let rc = nav_rect(i);
+            let selected = i == page;
+            if selected || hover == Hover::Nav(i) {
+                let plate = if selected {
+                    theme::CLR_NAV_SELECTED
+                } else {
+                    theme::CLR_NAV_HOVER
+                };
+                paint::round_rect(hdc, &rc, &paint::Style::flat(6, plate));
             }
+            if selected {
+                // The accent pill on the leading edge, the way Windows 11
+                // marks the current page.
+                let pill = RECT {
+                    left: rc.left,
+                    top: rc.top + 10,
+                    right: rc.left + 3,
+                    bottom: rc.bottom - 10,
+                };
+                paint::round_rect(hdc, &pill, &paint::Style::flat(1, theme::CLR_ACCENT));
+            }
+            let icon = RECT {
+                left: rc.left + 12,
+                right: rc.left + 36,
+                ..rc
+            };
+            let fg = if selected {
+                theme::CLR_TEXT_BRIGHT
+            } else {
+                theme::CLR_TEXT
+            };
+            theme::glyph(
+                hdc,
+                p.icon,
+                &icon,
+                16,
+                if selected { theme::CLR_ACCENT } else { theme::CLR_TEXT_DIM },
+            );
+            theme::text(
+                hdc,
+                strip_colon(i18n::t(p.title)),
+                &RECT {
+                    left: rc.left + 44,
+                    right: rc.right - 8,
+                    ..rc
+                },
+                theme::ui_font(FONT_BODY, if selected { 600 } else { 400 }),
+                fg,
+                theme::DT_LEFT_VCENTER | theme::DT_ELLIPSIS,
+            );
         }
 
-        // Field frames — accent when the field has focus, the closest GDI gets
-        // to a focus ring.
+        // ── Close button, top right ──
+        let close = close_rect();
+        if hover == Hover::Close {
+            fill(hdc, &close, theme::CLR_CLOSE_HOVER);
+        }
+        theme::glyph(
+            hdc,
+            theme::ICON_CLOSE,
+            &close,
+            10,
+            if hover == Hover::Close {
+                0x00FF_FFFF
+            } else {
+                theme::CLR_TEXT_DIM
+            },
+        );
+
+        // ── Page heading ──
+        theme::text(
+            hdc,
+            strip_colon(i18n::t(PAGES[page].title)),
+            &RECT {
+                left: CX0,
+                top: HEADING_Y,
+                right: CX1 - CLOSE_W,
+                bottom: HEADING_Y + HEADING_H,
+            },
+            theme::ui_font(FONT_HEADING, 600),
+            theme::CLR_TEXT_BRIGHT,
+            theme::DT_LEFT_VCENTER | theme::DT_ELLIPSIS,
+        );
+
+        // ── Groups ──
         let focused = GetFocus();
         let focused_id = if focused.0.is_null() {
             0
         } else {
             GetDlgCtrlID(focused)
         };
-        for (id, rc) in input_rects() {
-            draw_field_frame(hdc, &field_frame(&rc), id == focused_id);
-        }
-
-        draw_key_status(hdc);
-
-        let _ = EndPaint(hwnd, &ps);
+        with_geo(|geo| {
+            for g in &geo.pages[page] {
+                paint_group(hdc, g, dirty, focused_id);
+            }
+        });
     }
 }
 
-/// Recessed fill and a border that turns accent on focus — the closest GDI
-/// gets to a macOS focus ring.  Shared by the native EDITs (framed by the
-/// parent) and the custom hotkey / language controls (which paint their own).
+unsafe fn paint_group(hdc: HDC, g: &GroupGeo, dirty: &RECT, focused_id: i32) {
+    unsafe {
+        use layout::*;
+        let body = theme::ui_font(FONT_BODY, 400);
+
+        if let Some((key, y)) = g.title {
+            theme::text(
+                hdc,
+                i18n::t(key),
+                &RECT {
+                    left: g.card.left + 4,
+                    top: y,
+                    right: g.card.right,
+                    bottom: y + TITLE_H,
+                },
+                theme::ui_font(FONT_TITLE, 600),
+                theme::CLR_TEXT_DIM,
+                theme::DT_LEFT_VCENTER | theme::DT_ELLIPSIS,
+            );
+        }
+
+        if intersects(&g.card, dirty) {
+            paint::round_rect(
+                hdc,
+                &g.card,
+                &paint::Style::flat(CARD_R, theme::CLR_CARD).border(theme::CLR_SEPARATOR),
+            );
+            for r in g.rows.iter().skip(1) {
+                paint::hairline(
+                    hdc,
+                    g.card.left + ROW_PAD,
+                    g.card.right - ROW_PAD,
+                    r.top,
+                    theme::CLR_SEPARATOR,
+                );
+            }
+        }
+
+        for r in &g.rows {
+            let label_until = |w: i32| g.card.right - ROW_PAD - w - 16;
+            let row_label = |text: &str, right: i32| {
+                theme::text(
+                    hdc,
+                    strip_colon(text),
+                    &RECT {
+                        left: g.card.left + ROW_PAD,
+                        top: r.top,
+                        right,
+                        bottom: r.top + r.h,
+                    },
+                    body,
+                    theme::CLR_TEXT_BRIGHT,
+                    theme::DT_LEFT_VCENTER | theme::DT_ELLIPSIS,
+                )
+            };
+            match r.row {
+                Row::Language => {
+                    row_label(i18n::t("settings.label.language"), label_until(VALUE_W))
+                }
+                Row::Hotkey(_, key) => row_label(i18n::t(key), label_until(VALUE_W)),
+                Row::Switch(_, key) => row_label(i18n::t(key), label_until(SWITCH_W)),
+                Row::Folder => {
+                    let frame = folder_field(&g.card, r);
+                    draw_field_frame(hdc, &frame, focused_id == IDC_EDIT_FOLDER);
+                }
+                Row::Key(svc) => {
+                    let line = key_label_line(&g.card, r);
+                    let right = draw_key_status(hdc, svc, &line);
+                    theme::text(
+                        hdc,
+                        strip_colon(i18n::t(svc.label())),
+                        &RECT {
+                            right: right - 12,
+                            ..line
+                        },
+                        body,
+                        theme::CLR_TEXT_BRIGHT,
+                        theme::DT_LEFT_VCENTER | theme::DT_ELLIPSIS,
+                    );
+                    let frame = key_field(&g.card, r);
+                    draw_field_frame(hdc, &frame, focused_id == svc.edit_id());
+                }
+            }
+        }
+
+        if let Some((key, rc)) = g.footnote {
+            theme::text(
+                hdc,
+                i18n::t(key),
+                &rc,
+                theme::ui_font(FONT_META, 400),
+                theme::CLR_HINT,
+                theme::DT_WRAP,
+            );
+        }
+    }
+}
+
+/// A key's status, right-aligned on its label line: a dot in the state's
+/// colour and a word.  Returns where it starts, for the label to stop short.
+unsafe fn draw_key_status(hdc: HDC, svc: Service, line: &RECT) -> i32 {
+    unsafe {
+        let (text, color) = status_look(svc);
+        let font = theme::ui_font(FONT_META, 500);
+        let (tw, _) = theme::measure(hdc, text, font);
+        let text_rc = RECT {
+            left: line.right - tw,
+            ..*line
+        };
+        theme::text(hdc, text, &text_rc, font, color, theme::DT_RIGHT_VCENTER);
+        let cy = (line.top + line.bottom) / 2;
+        let dot_cx = text_rc.left - 9;
+        paint::circle(hdc, dot_cx, cy, 4, color);
+        dot_cx - 4
+    }
+}
+
+/// Recessed fill and a border that turns accent on focus — shared by the
+/// native edits (framed here) and the custom hotkey / language controls
+/// (which paint their own).
 fn field_style(focused: bool) -> paint::Style {
-    paint::Style::flat(FIELD_R, theme::CLR_FIELD)
+    paint::Style::flat(6, theme::CLR_FIELD)
         .border(if focused {
             theme::CLR_ACCENT
         } else {
@@ -1453,48 +1983,44 @@ unsafe fn draw_field_frame(hdc: HDC, rc: &RECT, focused: bool) {
     unsafe { paint::round_rect(hdc, rc, &field_style(focused)) }
 }
 
-// ============================================================
-// Helpers
-// ============================================================
+fn strip_colon(s: &str) -> &str {
+    s.trim_end().trim_end_matches([':', '：']).trim_end()
+}
 
-/// Invalidate just the frame around every input field, so focus changes
-/// repaint the ring without touching the rest of the window.
-unsafe fn invalidate_input_borders(hwnd: HWND) {
+/// Repaints just the field frames on the current page, so focus changes move
+/// the ring without touching anything else.
+unsafe fn invalidate_frames(hwnd: HWND) {
     unsafe {
-        for (_, rc) in input_rects() {
-            let _ = InvalidateRect(hwnd, Some(&field_frame(&rc)), false);
+        for (_, rc) in field_frames(current_page()) {
+            let _ = InvalidateRect(hwnd, Some(&rc), false);
         }
     }
 }
 
-// ============================================================
-// Command dispatch & save
-// ============================================================
-
-unsafe fn do_save(hwnd: HWND) {
+unsafe fn set_hover(hwnd: HWND, new: Hover) {
     unsafe {
-        let new_settings = Settings {
-            hk_translate: read_hotkey(hwnd, IDC_HK_TRANSLATE),
-            hk_ocr: read_hotkey(hwnd, IDC_HK_OCR),
-            hk_screenshot: read_hotkey(hwnd, IDC_HK_SCREENSHOT),
-            hk_layout: read_hotkey(hwnd, IDC_HK_LAYOUT),
-            hk_explorer_cmd: read_hotkey(hwnd, IDC_HK_EXPLORER_CMD),
-            hk_ask: read_hotkey(hwnd, IDC_HK_ASK),
-            screenshot_folder: read_folder(hwnd),
-            punto_enabled: read_checkbox(hwnd, IDC_CHK_PUNTO),
-            taskbar_center_enabled: read_checkbox(hwnd, IDC_CHK_TASKBAR),
-            language: read_selected_language(hwnd),
-            deepseek_api_key: read_deepseek_key(hwnd).trim().to_string(),
-        };
-
-        // Side-channel toggles (registry / context menu).
-        autostart::set_enabled(read_checkbox(hwnd, IDC_CHK_AUTOSTART));
-        crate::explorer_cmd::set_menu_enabled(read_checkbox(hwnd, IDC_CHK_EXPLORER_CMD));
-
-        settings::save(&new_settings);
-        *UPDATED_SETTINGS.lock().unwrap() = Some(Box::new(new_settings));
-        let _ = DestroyWindow(hwnd);
+        let old = std::mem::replace(&mut *HOVER.lock().unwrap(), new);
+        if old == new {
+            return;
+        }
+        for h in [old, new] {
+            let rc = match h {
+                Hover::Nav(i) => nav_rect(i),
+                Hover::Close => close_rect(),
+                Hover::None => continue,
+            };
+            let _ = InvalidateRect(hwnd, Some(&rc), false);
+        }
     }
+}
+
+fn hover_at(x: i32, y: i32) -> Hover {
+    if contains(&close_rect(), x, y) {
+        return Hover::Close;
+    }
+    (0..PAGES.len())
+        .find(|&i| contains(&nav_rect(i), x, y))
+        .map_or(Hover::None, Hover::Nav)
 }
 
 // ============================================================
@@ -1504,39 +2030,78 @@ unsafe fn do_save(hwnd: HWND) {
 unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         match msg {
-            WM_DRAWITEM => {
-                let dis = &*(lp.0 as *const DrawItemStruct);
-                if is_checkbox_id(dis.ctl_id as i32) {
-                    draw_owner_switch(dis);
+            // The whole window is client area — see `open`.
+            WM_NCCALCSIZE if wp.0 != 0 => LRESULT(0),
+            // Without a caption to repaint, the default would flash one in.
+            WM_NCACTIVATE => DefWindowProcW(hwnd, msg, wp, LPARAM(-1)),
+            WM_NCHITTEST => {
+                let mut pt = POINT {
+                    x: (lp.0 & 0xFFFF) as i16 as i32,
+                    y: ((lp.0 >> 16) & 0xFFFF) as i16 as i32,
+                };
+                let _ = ScreenToClient(hwnd, &mut pt);
+                let over_nav = (0..PAGES.len()).any(|i| contains(&nav_rect(i), pt.x, pt.y));
+                if pt.y < layout::DRAG_H && !contains(&close_rect(), pt.x, pt.y) && !over_nav {
+                    LRESULT(HTCAPTION as isize)
                 } else {
-                    draw_owner_button(lp);
+                    LRESULT(HTCLIENT as isize)
                 }
-                LRESULT(1)
             }
 
-            // The id is all there is to go on, so it decides both the label's
-            // colour and which surface it is standing on: row labels sit on a
-            // card, titles and footnotes on the window background.
-            WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
-                let hdc = HDC(wp.0 as *mut _);
-                SetBkMode(hdc, TRANSPARENT);
-                let id = GetDlgCtrlID(HWND(lp.0 as *mut _));
-                let r_guard = res();
-                let r = r_guard.as_ref().unwrap();
+            WM_ERASEBKGND => LRESULT(1),
+            WM_PAINT => {
+                paint(hwnd);
+                LRESULT(0)
+            }
 
-                let (text, brush) = if id >= IDC_ROW_LABEL {
-                    (theme::CLR_TEXT_BRIGHT, r.card_brush())
-                } else if id == IDC_FOOTNOTE {
-                    (theme::CLR_HINT, r.bg_brush())
-                } else if (IDC_GROUP_TITLE..IDC_FOOTNOTE).contains(&id) {
-                    (theme::CLR_TEXT_DIM, r.bg_brush())
-                } else if is_checkbox_id(id) {
-                    (theme::CLR_TEXT, r.card_brush())
-                } else {
-                    (theme::CLR_TEXT, r.bg_brush())
-                };
-                SetTextColor(hdc, COLORREF(text));
-                LRESULT(brush.0 as isize)
+            WM_MOUSEMOVE => {
+                let (x, y) = ((lp.0 & 0xFFFF) as i16 as i32, (lp.0 >> 16) as i16 as i32);
+                set_hover(hwnd, hover_at(x, y));
+                let mut tracking = TRACKING.lock().unwrap();
+                if !*tracking {
+                    let mut tme = TRACKMOUSEEVENT {
+                        cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: hwnd,
+                        dwHoverTime: 0,
+                    };
+                    *tracking = TrackMouseEvent(&mut tme).is_ok();
+                }
+                LRESULT(0)
+            }
+            WM_MOUSELEAVE => {
+                *TRACKING.lock().unwrap() = false;
+                set_hover(hwnd, Hover::None);
+                LRESULT(0)
+            }
+            WM_LBUTTONDOWN => {
+                let (x, y) = ((lp.0 & 0xFFFF) as i16 as i32, (lp.0 >> 16) as i16 as i32);
+                match hover_at(x, y) {
+                    Hover::Close => {
+                        let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+                    }
+                    Hover::Nav(i) => show_page(hwnd, i),
+                    Hover::None => {
+                        // A click on a field's padding still lands in it.
+                        let hit = field_frames(current_page())
+                            .into_iter()
+                            .find(|(_, rc)| contains(rc, x, y));
+                        match hit {
+                            Some((id, _)) => {
+                                let _ = SetFocus(GetDlgItem(hwnd, id).unwrap_or_default());
+                            }
+                            None => {
+                                let _ = SetFocus(hwnd);
+                            }
+                        }
+                    }
+                }
+                LRESULT(0)
+            }
+
+            WM_DRAWITEM => {
+                draw_item(lp);
+                LRESULT(1)
             }
 
             WM_CTLCOLOREDIT => {
@@ -1545,38 +2110,59 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 SetTextColor(hdc, COLORREF(theme::CLR_TEXT_BRIGHT));
                 LRESULT(res().as_ref().unwrap().field_brush().0 as isize)
             }
-
-            WM_PAINT => {
-                paint(hwnd);
-                LRESULT(0)
+            WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
+                let hdc = HDC(wp.0 as *mut _);
+                SetBkMode(hdc, TRANSPARENT);
+                SetTextColor(hdc, COLORREF(theme::CLR_TEXT));
+                LRESULT(res().as_ref().unwrap().card_brush().0 as isize)
             }
 
             WM_COMMAND => {
                 let code = ((wp.0 >> 16) & 0xFFFF) as u16;
                 let id = (wp.0 & 0xFFFF) as i32;
-                // EN_SETFOCUS = 0x0100, EN_KILLFOCUS = 0x0200 (native EDIT).
-                if code == 0x0100 || code == 0x0200 {
-                    invalidate_input_borders(hwnd);
+                if code == EN_SETFOCUS || code == EN_KILLFOCUS {
+                    invalidate_frames(hwnd);
                 }
-                // Re-check the key once the user is done typing it.
-                if code == 0x0200 && id == IDC_EDIT_DEEPSEEK {
-                    start_key_check(hwnd, &read_deepseek_key(hwnd));
+                if let Some(svc) = Service::from_edit_id(id) {
+                    match code {
+                        // Re-check once the user is done typing — on leaving
+                        // the field, or after a pause.
+                        EN_KILLFOCUS => {
+                            let _ = KillTimer(hwnd, TIMER_KEY + svc.index());
+                            start_key_check(svc, &read_edit_text(hwnd, id));
+                        }
+                        EN_CHANGE => {
+                            let _ = SetTimer(hwnd, TIMER_KEY + svc.index(), KEY_DEBOUNCE_MS, None);
+                        }
+                        _ => {}
+                    }
                 }
-                // BN_CLICKED on an owner-drawn checkbox (notify == 0) — flip
-                // the stashed state and repaint the control.
-                if code == 0 && is_checkbox_id(id) {
+                // BN_CLICKED is 0.
+                if code == 0 && is_switch_id(id) {
                     let ctrl = HWND(lp.0 as *mut _);
                     let cur = GetWindowLongPtrW(ctrl, GWLP_USERDATA);
-                    SetWindowLongPtrW(ctrl, GWLP_USERDATA, if cur == 0 { 1 } else { 0 });
+                    SetWindowLongPtrW(ctrl, GWLP_USERDATA, (cur == 0) as isize);
                     let _ = InvalidateRect(ctrl, None, false);
                 }
+                if code == 0 && is_eye_id(id) {
+                    toggle_eye(hwnd, HWND(lp.0 as *mut _), id);
+                }
                 match id {
-                    IDC_BTN_SAVE => do_save(hwnd),
-                    IDC_BTN_CANCEL => {
+                    IDC_BTN_SAVE | IDOK_CMD => do_save(hwnd),
+                    IDC_BTN_CANCEL | IDCANCEL_CMD => {
                         let _ = DestroyWindow(hwnd);
                     }
                     IDC_BTN_BROWSE => browse_folder(hwnd),
                     _ => {}
+                }
+                LRESULT(0)
+            }
+
+            WM_TIMER => {
+                let idx = wp.0.wrapping_sub(TIMER_KEY);
+                if let Some(&svc) = Service::ALL.get(idx) {
+                    let _ = KillTimer(hwnd, wp.0);
+                    start_key_check(svc, &read_edit_text(hwnd, svc.edit_id()));
                 }
                 LRESULT(0)
             }
@@ -1587,6 +2173,9 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             }
             WM_DESTROY => {
                 *SETTINGS_HWND.lock().unwrap() = 0;
+                CONTROLS.lock().unwrap().clear();
+                *HOT_BUTTON.lock().unwrap() = 0;
+                *TRACKING.lock().unwrap() = false;
                 LRESULT(0)
             }
 
@@ -1594,9 +2183,14 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 apply_browse_result(hwnd, lp);
                 LRESULT(0)
             }
-
             m if m == WM_APP_KEY_STATUS => {
-                invalidate_key_status(hwnd);
+                if let Some(&svc) = Service::ALL.get(wp.0) {
+                    if let Some((page, rc)) = key_status_rect(svc) {
+                        if page == current_page() {
+                            let _ = InvalidateRect(hwnd, Some(&rc), false);
+                        }
+                    }
+                }
                 LRESULT(0)
             }
 
@@ -1606,37 +2200,14 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
 }
 
 // ============================================================
-// Custom HOTKEY control — owner-drawn, same visual language as the
-// rest of the settings panel.  Captures key combos directly and
-// exposes get/set via HK_MSG_{GET,SET} custom messages.
+// Hotkey field — captures a key combination and shows it as keycaps.
+// Get/set via HK_MSG_{GET,SET}.
 // ============================================================
 
 struct HotkeyState {
     mods: u32,
     vk: u32,
     focused: bool,
-}
-
-static HOTKEY_CLASS_REGISTERED: Mutex<bool> = Mutex::new(false);
-
-unsafe fn register_hotkey_class(hinst: HINSTANCE) {
-    unsafe {
-        let mut g = HOTKEY_CLASS_REGISTERED.lock().unwrap();
-        if *g {
-            return;
-        }
-        let wc = WNDCLASSW {
-            style: CS_HREDRAW | CS_VREDRAW,
-            lpfnWndProc: Some(hotkey_proc),
-            hInstance: hinst,
-            hCursor: LoadCursorW(None, IDC_IBEAM).unwrap_or_default(),
-            hbrBackground: HBRUSH(std::ptr::null_mut()),
-            lpszClassName: w!("ScrTransHotkey"),
-            ..Default::default()
-        };
-        RegisterClassW(&wc);
-        *g = true;
-    }
 }
 
 unsafe fn hotkey_state(hwnd: HWND) -> Option<&'static mut HotkeyState> {
@@ -1649,22 +2220,15 @@ unsafe fn hotkey_state(hwnd: HWND) -> Option<&'static mut HotkeyState> {
 unsafe extern "system" fn hotkey_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         match msg {
-            WM_GETDLGCODE => LRESULT(0x000E), // WANTARROWS | WANTTAB | WANTALLKEYS
+            WM_GETDLGCODE => dlg_code(lp, false),
             WM_ERASEBKGND => LRESULT(1),
             WM_LBUTTONDOWN => {
                 let _ = SetFocus(hwnd);
                 LRESULT(0)
             }
-            WM_SETFOCUS => {
+            WM_SETFOCUS | WM_KILLFOCUS => {
                 if let Some(s) = hotkey_state(hwnd) {
-                    s.focused = true;
-                }
-                let _ = InvalidateRect(hwnd, None, false);
-                LRESULT(0)
-            }
-            WM_KILLFOCUS => {
-                if let Some(s) = hotkey_state(hwnd) {
-                    s.focused = false;
+                    s.focused = msg == WM_SETFOCUS;
                 }
                 let _ = InvalidateRect(hwnd, None, false);
                 LRESULT(0)
@@ -1678,8 +2242,7 @@ unsafe extern "system" fn hotkey_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 ) {
                     return LRESULT(0);
                 }
-                // Tab and Escape are reserved for UI navigation / dismiss —
-                // capturing them as hotkeys would break basic keyboard use.
+                // Tab and Escape are reserved for UI navigation / dismiss.
                 if vk == 0x09 || vk == 0x1B {
                     return LRESULT(0);
                 }
@@ -1692,17 +2255,14 @@ unsafe extern "system" fn hotkey_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                     let _ = InvalidateRect(hwnd, None, false);
                     return LRESULT(0);
                 }
-                let ctrl_down = (GetKeyState(0x11) as u16 & 0x8000) != 0;
-                let shift_down = (GetKeyState(0x10) as u16 & 0x8000) != 0;
-                let alt_down = (GetKeyState(0x12) as u16 & 0x8000) != 0;
                 let mut m = 0u32;
-                if ctrl_down {
+                if GetKeyState(0x11) < 0 {
                     m |= 0x0002;
                 }
-                if alt_down {
+                if GetKeyState(0x12) < 0 {
                     m |= 0x0001;
                 }
-                if shift_down {
+                if GetKeyState(0x10) < 0 {
                     m |= 0x0004;
                 }
                 if let Some(s) = hotkey_state(hwnd) {
@@ -1712,6 +2272,9 @@ unsafe extern "system" fn hotkey_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 let _ = InvalidateRect(hwnd, None, false);
                 LRESULT(0)
             }
+            // Alt+key arrives as a system character too; swallowing it keeps
+            // the default handler from beeping.
+            WM_SYSCHAR | WM_CHAR => LRESULT(0),
             WM_PAINT => {
                 let mut ps = PAINTSTRUCT::default();
                 let hdc = BeginPaint(hwnd, &mut ps);
@@ -1747,76 +2310,94 @@ unsafe extern "system" fn hotkey_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     }
 }
 
-unsafe fn paint_hotkey(hwnd: HWND, hdc: HDC, mods: u32, vk: u32, focused: bool) {
+/// Paints a custom control double-buffered: `draw` gets the client rect in
+/// an off-screen DC already filled with the card colour the control sits on.
+unsafe fn paint_control(hwnd: HWND, hdc: HDC, draw: impl FnOnce(HDC, &RECT)) {
     unsafe {
         let mut rc = RECT::default();
         let _ = GetClientRect(hwnd, &mut rc);
-
-        // Double-buffer so the rounded-rect fill + border + text land on
-        // screen as one frame.
-        let mem_dc = CreateCompatibleDC(hdc);
-        let mem_bmp = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
-        let old = SelectObject(mem_dc, mem_bmp);
-
-        // The card shows through the rounded corners — this control sits on
-        // one, not on the window background.
-        let card = CreateSolidBrush(COLORREF(theme::CLR_CARD));
-        FillRect(mem_dc, &rc, card);
-        let _ = DeleteObject(card);
-        paint::round_rect(mem_dc, &rc, &field_style(focused));
-
-        let text = hotkey_display(mods, vk, focused);
-        let r_guard = res();
-        let r = r_guard.as_ref().unwrap();
-        let old_font = SelectObject(mem_dc, r.font_body());
-        SetBkMode(mem_dc, TRANSPARENT);
-        let text_color = if vk == 0 {
-            theme::CLR_TEXT_DIM
-        } else {
-            theme::CLR_TEXT_BRIGHT
-        };
-        SetTextColor(mem_dc, COLORREF(text_color));
-        let mut wide = to_wide(&text);
-        if wide.last() == Some(&0) {
-            wide.pop();
-        }
-        let mut trc = RECT {
-            left: 12,
-            top: 0,
-            right: rc.right - 12,
-            bottom: rc.bottom,
-        };
-        DrawTextW(mem_dc, &mut wide, &mut trc, DRAW_TEXT_FORMAT(0x0824));
-        SelectObject(mem_dc, old_font);
-        drop(r_guard);
-
-        let _ = BitBlt(hdc, 0, 0, rc.right, rc.bottom, mem_dc, 0, 0, SRCCOPY);
-        SelectObject(mem_dc, old);
-        let _ = DeleteObject(mem_bmp);
-        let _ = DeleteDC(mem_dc);
+        let mem = CreateCompatibleDC(hdc);
+        let bmp = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
+        let old = SelectObject(mem, bmp);
+        fill(mem, &rc, theme::CLR_CARD);
+        draw(mem, &rc);
+        let _ = BitBlt(hdc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, old);
+        let _ = DeleteObject(bmp);
+        let _ = DeleteDC(mem);
     }
 }
 
-fn hotkey_display(mods: u32, vk: u32, focused: bool) -> String {
-    if vk == 0 {
-        if focused {
-            "…".to_string()
-        } else {
-            "—".to_string()
-        }
-    } else {
-        HotkeyConfig {
-            modifiers: mods,
-            vk,
-        }
-        .display()
+unsafe fn paint_hotkey(hwnd: HWND, hdc: HDC, mods: u32, vk: u32, focused: bool) {
+    unsafe {
+        paint_control(hwnd, hdc, |dc, rc| {
+            paint::round_rect(dc, rc, &field_style(focused));
+
+            if vk == 0 {
+                let hint = if focused {
+                    i18n::t("settings.hotkey.press")
+                } else {
+                    i18n::t("settings.hotkey.none")
+                };
+                theme::text(
+                    dc,
+                    hint,
+                    &RECT {
+                        left: rc.left + 12,
+                        right: rc.right - 10,
+                        ..*rc
+                    },
+                    theme::ui_font(FONT_BODY - 1, 400),
+                    theme::CLR_HINT,
+                    theme::DT_LEFT_VCENTER | theme::DT_ELLIPSIS,
+                );
+                return;
+            }
+
+            // One keycap per key of the combination.
+            let combo = HotkeyConfig {
+                modifiers: mods,
+                vk,
+            }
+            .display();
+            let font = theme::ui_font(FONT_META, 600);
+            let cap_h = rc.bottom - rc.top - 10;
+            let top = rc.top + 5;
+            let mut x = rc.left + 6;
+            for key in combo.split('+').filter(|k| !k.is_empty()) {
+                let (tw, _) = theme::measure(dc, key, font);
+                let cap = RECT {
+                    left: x,
+                    top,
+                    right: (x + tw + 14).min(rc.right - 6),
+                    bottom: top + cap_h,
+                };
+                if cap.right <= cap.left {
+                    break;
+                }
+                paint::round_rect(
+                    dc,
+                    &cap,
+                    &paint::Style::flat(4, theme::CLR_CTRL)
+                        .border(lighten(theme::CLR_CTRL, 10)),
+                );
+                theme::text(
+                    dc,
+                    key,
+                    &cap,
+                    font,
+                    theme::CLR_TEXT_BRIGHT,
+                    theme::DT_CENTER_VCENTER,
+                );
+                x = cap.right + 4;
+            }
+        });
     }
 }
 
 // ============================================================
-// Custom LANGUAGE combo — button + popup list.  Popup is a
-// separate WS_POPUP window that takes mouse capture so clicks
-// outside close it.
+// Language picker — a field that opens a floating list.  The list is a
+// separate layered popup that takes mouse capture so clicks outside close it.
 // ============================================================
 
 struct LangState {
@@ -1830,52 +2411,15 @@ struct LangPopupState {
     /// HWND of the owning combo — we poke its state from item clicks.
     owner: isize,
     hover: usize, // usize::MAX = none
-    item_h: i32,
-    pad: i32,
+    /// The list card's top-left on screen, and its size.
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
 }
 
-static LANG_CLASS_REGISTERED: Mutex<bool> = Mutex::new(false);
-static LANG_POPUP_CLASS_REGISTERED: Mutex<bool> = Mutex::new(false);
-
-unsafe fn register_lang_class(hinst: HINSTANCE) {
-    unsafe {
-        let mut g = LANG_CLASS_REGISTERED.lock().unwrap();
-        if *g {
-            return;
-        }
-        let wc = WNDCLASSW {
-            style: CS_HREDRAW | CS_VREDRAW,
-            lpfnWndProc: Some(lang_proc),
-            hInstance: hinst,
-            hCursor: LoadCursorW(None, IDC_HAND).unwrap_or_default(),
-            hbrBackground: HBRUSH(std::ptr::null_mut()),
-            lpszClassName: w!("ScrTransLangCombo"),
-            ..Default::default()
-        };
-        RegisterClassW(&wc);
-        *g = true;
-    }
-}
-
-unsafe fn register_lang_popup_class(hinst: HINSTANCE) {
-    unsafe {
-        let mut g = LANG_POPUP_CLASS_REGISTERED.lock().unwrap();
-        if *g {
-            return;
-        }
-        let wc = WNDCLASSW {
-            style: CS_HREDRAW | CS_VREDRAW,
-            lpfnWndProc: Some(lang_popup_proc),
-            hInstance: hinst,
-            hCursor: LoadCursorW(None, IDC_HAND).unwrap_or_default(),
-            hbrBackground: HBRUSH(std::ptr::null_mut()),
-            lpszClassName: w!("ScrTransLangPopup"),
-            ..Default::default()
-        };
-        RegisterClassW(&wc);
-        *g = true;
-    }
-}
+const LANG_ITEM_H: i32 = 30;
+const LANG_PAD: i32 = 6;
 
 unsafe fn lang_state(hwnd: HWND) -> Option<&'static mut LangState> {
     unsafe {
@@ -1894,50 +2438,53 @@ unsafe fn lang_popup_state(hwnd: HWND) -> Option<&'static mut LangPopupState> {
 unsafe extern "system" fn lang_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         match msg {
-            WM_GETDLGCODE => LRESULT(0x0001 | 0x0002),
+            WM_GETDLGCODE => {
+                let open = lang_state(hwnd).is_some_and(|s| s.popup != 0);
+                dlg_code(lp, open)
+            }
             WM_ERASEBKGND => LRESULT(1),
             WM_LBUTTONDOWN => {
                 let _ = SetFocus(hwnd);
-                let already_open = lang_state(hwnd).map(|s| s.popup != 0).unwrap_or(false);
-                if already_open {
-                    // Click on combo while popup is open — capture routes the
-                    // click to the popup instead, so this path is unused in
-                    // practice, but guard anyway.
+                if lang_state(hwnd).is_some_and(|s| s.popup != 0) {
                     let _ = ReleaseCapture();
                 } else {
                     open_lang_popup(hwnd);
                 }
                 LRESULT(0)
             }
-            WM_SETFOCUS => {
+            WM_SETFOCUS | WM_KILLFOCUS => {
                 if let Some(s) = lang_state(hwnd) {
-                    s.focused = true;
-                }
-                let _ = InvalidateRect(hwnd, None, false);
-                LRESULT(0)
-            }
-            WM_KILLFOCUS => {
-                if let Some(s) = lang_state(hwnd) {
-                    s.focused = false;
+                    s.focused = msg == WM_SETFOCUS;
                 }
                 let _ = InvalidateRect(hwnd, None, false);
                 LRESULT(0)
             }
             WM_KEYDOWN => {
                 let vk = wp.0 as u32;
-                let popup_open = lang_state(hwnd).map(|s| s.popup != 0).unwrap_or(false);
+                let popup_open = lang_state(hwnd).is_some_and(|s| s.popup != 0);
+                let n = Language::all().len();
                 match vk {
                     0x1B if popup_open => {
                         let _ = ReleaseCapture();
-                    } // Esc closes popup
-                    0x0D | 0x20 | 0x28 => {
-                        open_lang_popup(hwnd);
-                    } // Enter / Space / Down
-                    0x26 => {
-                        // Up — cycle selection
+                    }
+                    0x0D | 0x20 if popup_open => {
+                        let _ = ReleaseCapture();
+                    }
+                    0x0D | 0x20 => open_lang_popup(hwnd),
+                    // Up / Down step through the list, open or not.
+                    0x26 | 0x28 => {
                         if let Some(s) = lang_state(hwnd) {
-                            if s.selected > 0 {
-                                s.selected -= 1;
+                            s.selected = if vk == 0x26 {
+                                s.selected.saturating_sub(1)
+                            } else {
+                                (s.selected + 1).min(n - 1)
+                            };
+                            if s.popup != 0 {
+                                let popup = HWND(s.popup as *mut _);
+                                if let Some(ps) = lang_popup_state(popup) {
+                                    ps.hover = s.selected;
+                                }
+                                present_lang_popup(popup);
                             }
                         }
                         let _ = InvalidateRect(hwnd, None, false);
@@ -1949,10 +2496,10 @@ unsafe extern "system" fn lang_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             WM_PAINT => {
                 let mut ps = PAINTSTRUCT::default();
                 let hdc = BeginPaint(hwnd, &mut ps);
-                let (selected, focused) = lang_state(hwnd)
-                    .map(|s| (s.selected, s.focused))
-                    .unwrap_or((0, false));
-                paint_lang(hwnd, hdc, selected, focused);
+                let (selected, focused, open) = lang_state(hwnd)
+                    .map(|s| (s.selected, s.focused, s.popup != 0))
+                    .unwrap_or((0, false, false));
+                paint_lang(hwnd, hdc, selected, focused || open);
                 let _ = EndPaint(hwnd, &ps);
                 LRESULT(0)
             }
@@ -1961,7 +2508,7 @@ unsafe extern "system" fn lang_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 .unwrap_or(LRESULT(0)),
             m if m == LANG_MSG_SET => {
                 if let Some(s) = lang_state(hwnd) {
-                    s.selected = wp.0 as usize;
+                    s.selected = wp.0;
                 }
                 let _ = InvalidateRect(hwnd, None, false);
                 LRESULT(0)
@@ -1985,88 +2532,83 @@ unsafe extern "system" fn lang_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
 
 unsafe fn paint_lang(hwnd: HWND, hdc: HDC, selected: usize, focused: bool) {
     unsafe {
-        let mut rc = RECT::default();
-        let _ = GetClientRect(hwnd, &mut rc);
-
-        let mem_dc = CreateCompatibleDC(hdc);
-        let mem_bmp = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
-        let old = SelectObject(mem_dc, mem_bmp);
-
-        let card = CreateSolidBrush(COLORREF(theme::CLR_CARD));
-        FillRect(mem_dc, &rc, card);
-        let _ = DeleteObject(card);
-        paint::round_rect(mem_dc, &rc, &field_style(focused));
-
-        let langs = Language::all();
-        let name = langs.get(selected).map(|l| l.native_name()).unwrap_or("");
-        let r_guard = res();
-        let r = r_guard.as_ref().unwrap();
-        let old_font = SelectObject(mem_dc, r.font_body());
-        SetBkMode(mem_dc, TRANSPARENT);
-        SetTextColor(mem_dc, COLORREF(theme::CLR_TEXT_BRIGHT));
-        let mut wide = to_wide(name);
-        if wide.last() == Some(&0) {
-            wide.pop();
-        }
-        let mut trc = RECT {
-            left: 14,
-            top: 0,
-            right: rc.right - 32,
-            bottom: rc.bottom,
-        };
-        DrawTextW(mem_dc, &mut wide, &mut trc, DRAW_TEXT_FORMAT(0x0824));
-        SelectObject(mem_dc, old_font);
-        drop(r_guard);
-
-        // Chevron ▼
-        let cx = rc.right - 16;
-        let cy = rc.bottom / 2 + 1;
-        let chev_pen = CreatePen(PS_SOLID, 2, COLORREF(theme::CLR_TEXT));
-        let op2 = SelectObject(mem_dc, chev_pen);
-        let _ = MoveToEx(mem_dc, cx - 5, cy - 3, None);
-        let _ = LineTo(mem_dc, cx, cy + 3);
-        let _ = MoveToEx(mem_dc, cx + 1, cy + 2, None);
-        let _ = LineTo(mem_dc, cx + 6, cy - 3);
-        SelectObject(mem_dc, op2);
-        let _ = DeleteObject(chev_pen);
-
-        let _ = BitBlt(hdc, 0, 0, rc.right, rc.bottom, mem_dc, 0, 0, SRCCOPY);
-        SelectObject(mem_dc, old);
-        let _ = DeleteObject(mem_bmp);
-        let _ = DeleteDC(mem_dc);
+        paint_control(hwnd, hdc, |dc, rc| {
+            paint::round_rect(dc, rc, &field_style(focused));
+            let name = Language::all()
+                .get(selected)
+                .map(|l| l.native_name())
+                .unwrap_or("");
+            theme::text(
+                dc,
+                name,
+                &RECT {
+                    left: rc.left + 12,
+                    right: rc.right - 32,
+                    ..*rc
+                },
+                theme::ui_font(FONT_BODY, 400),
+                theme::CLR_TEXT_BRIGHT,
+                theme::DT_LEFT_VCENTER | theme::DT_ELLIPSIS,
+            );
+            theme::glyph(
+                dc,
+                theme::ICON_CHEVRON_DOWN,
+                &RECT {
+                    left: rc.right - 30,
+                    right: rc.right - 8,
+                    ..*rc
+                },
+                10,
+                theme::CLR_TEXT_DIM,
+            );
+        });
     }
 }
 
 unsafe fn open_lang_popup(owner: HWND) {
     unsafe {
-        if let Some(s) = lang_state(owner) {
-            if s.popup != 0 {
-                return;
-            }
+        if lang_state(owner).is_some_and(|s| s.popup != 0) {
+            return;
         }
         let Ok(hmodule) = GetModuleHandleW(None) else {
             return;
         };
         let hinst = HINSTANCE(hmodule.0);
-        register_lang_popup_class(hinst);
+        register_class(hinst, w!("ScrTransLangPopup2"), lang_popup_proc, IDC_ARROW);
 
         let mut rc = RECT::default();
         let _ = GetWindowRect(owner, &mut rc);
-        let item_h = 32i32;
-        let pad = 6i32;
         let n = Language::all().len() as i32;
-        let popup_w = rc.right - rc.left;
-        let popup_h = item_h * n + pad * 2;
+        let w = rc.right - rc.left;
+        let h = LANG_ITEM_H * n + LANG_PAD * 2;
 
+        // Below the field, or above it when the screen runs out.
+        let mon = MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let screen_bottom = if GetMonitorInfoW(mon, &mut mi).as_bool() {
+            mi.rcWork.bottom
+        } else {
+            GetSystemMetrics(SM_CYSCREEN)
+        };
+        let y = if rc.bottom + 6 + h > screen_bottom {
+            rc.top - 6 - h
+        } else {
+            rc.bottom + 6
+        };
+
+        let m = paint::CARD_MARGIN;
         let popup = CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
-            w!("ScrTransLangPopup"),
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED,
+            w!("ScrTransLangPopup2"),
             w!(""),
             WS_POPUP,
-            rc.left,
-            rc.bottom + 4,
-            popup_w,
-            popup_h,
+            rc.left - m,
+            y - m,
+            w + 2 * m,
+            h + 2 * m,
             owner,
             HMENU::default(),
             hinst,
@@ -2080,19 +2622,37 @@ unsafe fn open_lang_popup(owner: HWND) {
         let state = Box::into_raw(Box::new(LangPopupState {
             owner: owner.0 as isize,
             hover: lang_state(owner).map(|s| s.selected).unwrap_or(0),
-            item_h,
-            pad,
+            x: rc.left,
+            y,
+            w,
+            h,
         }));
         SetWindowLongPtrW(popup, GWLP_USERDATA, state as isize);
 
         if let Some(s) = lang_state(owner) {
             s.popup = popup.0 as isize;
         }
+        let _ = InvalidateRect(owner, None, false);
 
+        present_lang_popup(popup);
         let _ = ShowWindow(popup, SW_SHOWNA);
         // Capture so clicks outside the popup close it.  WM_CAPTURECHANGED
         // is the canonical "close yourself" signal.
         SetCapture(popup);
+    }
+}
+
+/// The list item under a point in popup client coordinates, if any.
+unsafe fn lang_item_at(hwnd: HWND, lp: LPARAM) -> Option<usize> {
+    unsafe {
+        let s = lang_popup_state(hwnd)?;
+        let x = (lp.0 & 0xFFFF) as i16 as i32 - paint::CARD_MARGIN;
+        let y = ((lp.0 >> 16) & 0xFFFF) as i16 as i32 - paint::CARD_MARGIN;
+        if x < 0 || x >= s.w || y < LANG_PAD || y >= s.h - LANG_PAD {
+            return None;
+        }
+        let idx = ((y - LANG_PAD) / LANG_ITEM_H) as usize;
+        (idx < Language::all().len()).then_some(idx)
     }
 }
 
@@ -2101,45 +2661,22 @@ unsafe extern "system" fn lang_popup_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
         match msg {
             WM_ERASEBKGND => LRESULT(1),
             WM_MOUSEMOVE => {
-                let x = (lp.0 & 0xFFFF) as i16 as i32;
-                let y = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
-                let mut client = RECT::default();
-                let _ = GetClientRect(hwnd, &mut client);
-                if let Some(s) = lang_popup_state(hwnd) {
-                    let inside = x >= 0 && y >= 0 && x < client.right && y < client.bottom;
-                    let new_hover = if inside {
-                        let idx = (y - s.pad) / s.item_h;
-                        if idx >= 0 && (idx as usize) < Language::all().len() {
-                            idx as usize
-                        } else {
-                            usize::MAX
-                        }
-                    } else {
-                        usize::MAX
-                    };
-                    if new_hover != s.hover {
-                        s.hover = new_hover;
-                        let _ = InvalidateRect(hwnd, None, false);
-                    }
+                let hover = lang_item_at(hwnd, lp).unwrap_or(usize::MAX);
+                let changed = lang_popup_state(hwnd).is_some_and(|s| {
+                    let c = s.hover != hover;
+                    s.hover = hover;
+                    c
+                });
+                if changed {
+                    present_lang_popup(hwnd);
                 }
                 LRESULT(0)
             }
             WM_LBUTTONDOWN => {
-                let x = (lp.0 & 0xFFFF) as i16 as i32;
-                let y = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
-                let mut client = RECT::default();
-                let _ = GetClientRect(hwnd, &mut client);
-                let (owner_raw, pad, item_h) = lang_popup_state(hwnd)
-                    .map(|s| (s.owner, s.pad, s.item_h))
-                    .unwrap_or((0, 0, 1));
-                let owner = HWND(owner_raw as *mut _);
-                let inside = x >= 0 && y >= 0 && x < client.right && y < client.bottom;
-                if inside {
-                    let idx = (y - pad) / item_h;
-                    if idx >= 0 && (idx as usize) < Language::all().len() {
-                        if let Some(os) = lang_state(owner) {
-                            os.selected = idx as usize;
-                        }
+                if let Some(idx) = lang_item_at(hwnd, lp) {
+                    let owner = lang_popup_state(hwnd).map(|s| s.owner).unwrap_or(0);
+                    if let Some(os) = lang_state(HWND(owner as *mut _)) {
+                        os.selected = idx;
                     }
                 }
                 // Closing routes through ReleaseCapture → WM_CAPTURECHANGED.
@@ -2159,9 +2696,10 @@ unsafe extern "system" fn lang_popup_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
                 LRESULT(0)
             }
             WM_PAINT => {
+                // Layered: the content goes up through UpdateLayeredWindow,
+                // so there's nothing to paint here but the validation.
                 let mut ps = PAINTSTRUCT::default();
-                let hdc = BeginPaint(hwnd, &mut ps);
-                paint_lang_popup(hwnd, hdc);
+                let _ = BeginPaint(hwnd, &mut ps);
                 let _ = EndPaint(hwnd, &ps);
                 LRESULT(0)
             }
@@ -2178,107 +2716,65 @@ unsafe extern "system" fn lang_popup_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
     }
 }
 
-unsafe fn paint_lang_popup(hwnd: HWND, hdc: HDC) {
+unsafe fn present_lang_popup(hwnd: HWND) {
     unsafe {
-        let mut rc = RECT::default();
-        let _ = GetClientRect(hwnd, &mut rc);
-
-        let mem_dc = CreateCompatibleDC(hdc);
-        let mem_bmp = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
-        let old = SelectObject(mem_dc, mem_bmp);
-
-        // Floating list panel, the shape of a macOS menu.
-        let bg = CreateSolidBrush(COLORREF(theme::CLR_BG));
-        FillRect(mem_dc, &rc, bg);
-        let _ = DeleteObject(bg);
-        paint::round_rect(
-            mem_dc,
-            &rc,
-            &paint::Style::flat(10, theme::CLR_FIELD).border(theme::CLR_FIELD_BORDER),
-        );
-
         let Some(s) = lang_popup_state(hwnd) else {
-            let _ = BitBlt(hdc, 0, 0, rc.right, rc.bottom, mem_dc, 0, 0, SRCCOPY);
-            SelectObject(mem_dc, old);
-            let _ = DeleteObject(mem_bmp);
-            let _ = DeleteDC(mem_dc);
             return;
         };
         let owner = HWND(s.owner as *mut _);
-        let selected = lang_state(owner)
-            .map(|os| os.selected)
-            .unwrap_or(usize::MAX);
-
-        let langs = Language::all();
-        let r_guard = res();
-        let r = r_guard.as_ref().unwrap();
-        let old_font = SelectObject(mem_dc, r.font_body());
-        SetBkMode(mem_dc, TRANSPARENT);
-
-        for (i, lang) in langs.iter().enumerate() {
-            let y = s.pad + (i as i32) * s.item_h;
-            let item_rc = RECT {
-                left: s.pad,
-                top: y,
-                right: rc.right - s.pad,
-                bottom: y + s.item_h,
-            };
-            let is_hover = i == s.hover;
-            let is_selected = i == selected;
-
-            // Hovered row gets an accent plate, the way an open macOS menu
-            // tracks the pointer; the current choice is marked with a tick
-            // rather than a coloured bar.
-            if is_hover {
-                paint::round_rect(
-                    mem_dc,
-                    &item_rc,
-                    &paint::Style::flat(FIELD_R, theme::CLR_ACCENT),
-                );
-            } else if is_selected {
-                paint::round_rect(
-                    mem_dc,
-                    &item_rc,
-                    &paint::Style::flat(FIELD_R, CLR_ROW_SELECTED),
-                );
-            }
-            if is_selected {
-                let tick = CreatePen(
-                    PS_SOLID,
-                    2,
-                    COLORREF(if is_hover {
+        let selected = lang_state(owner).map(|os| os.selected).unwrap_or(usize::MAX);
+        let (hover, w) = (s.hover, s.w);
+        let card = paint::Card {
+            w: s.w,
+            h: s.h,
+            radius: 10,
+            fill: theme::CLR_ELEVATED,
+            border: theme::CLR_SEPARATOR,
+        };
+        paint::present_card(hwnd, s.x, s.y, &card, 255, |dc| {
+            for (i, lang) in Language::all().iter().enumerate() {
+                let top = LANG_PAD + i as i32 * LANG_ITEM_H;
+                let item = RECT {
+                    left: LANG_PAD,
+                    top,
+                    right: w - LANG_PAD,
+                    bottom: top + LANG_ITEM_H,
+                };
+                let is_hover = i == hover;
+                let is_selected = i == selected;
+                if is_hover {
+                    paint::round_rect(dc, &item, &paint::Style::flat(6, theme::CLR_ACCENT));
+                }
+                if is_selected {
+                    let tick = RECT {
+                        left: item.left + 4,
+                        right: item.left + 26,
+                        ..item
+                    };
+                    let color = if is_hover {
                         0x00FF_FFFF
                     } else {
                         theme::CLR_ACCENT
-                    }),
+                    };
+                    theme::glyph(dc, theme::ICON_CHECK, &tick, 12, color);
+                }
+                theme::text(
+                    dc,
+                    lang.native_name(),
+                    &RECT {
+                        left: item.left + 30,
+                        right: item.right - 8,
+                        ..item
+                    },
+                    theme::ui_font(FONT_BODY, if is_selected { 600 } else { 400 }),
+                    if is_hover {
+                        0x00FF_FFFF
+                    } else {
+                        theme::CLR_TEXT_BRIGHT
+                    },
+                    theme::DT_LEFT_VCENTER | theme::DT_ELLIPSIS,
                 );
-                let op = SelectObject(mem_dc, tick);
-                let cx = item_rc.left + 10;
-                let cy = (item_rc.top + item_rc.bottom) / 2;
-                let _ = MoveToEx(mem_dc, cx - 4, cy, None);
-                let _ = LineTo(mem_dc, cx - 1, cy + 4);
-                let _ = LineTo(mem_dc, cx + 5, cy - 4);
-                SelectObject(mem_dc, op);
-                let _ = DeleteObject(tick);
             }
-
-            SetTextColor(mem_dc, COLORREF(theme::CLR_TEXT_BRIGHT));
-            let mut wide = to_wide(lang.native_name());
-            if wide.last() == Some(&0) {
-                wide.pop();
-            }
-            let mut text_rc = RECT {
-                left: item_rc.left + 16,
-                ..item_rc
-            };
-            DrawTextW(mem_dc, &mut wide, &mut text_rc, DRAW_TEXT_FORMAT(0x0824));
-        }
-        SelectObject(mem_dc, old_font);
-        drop(r_guard);
-
-        let _ = BitBlt(hdc, 0, 0, rc.right, rc.bottom, mem_dc, 0, 0, SRCCOPY);
-        SelectObject(mem_dc, old);
-        let _ = DeleteObject(mem_bmp);
-        let _ = DeleteDC(mem_dc);
+        });
     }
 }

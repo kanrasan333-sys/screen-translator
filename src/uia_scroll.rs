@@ -11,6 +11,7 @@
 //! publishing the pattern — some PDF viewers, canvas editors, games — don't,
 //! which is why the wheel path stays as the fallback.
 
+use std::cell::Cell;
 use std::thread;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::POINT;
@@ -50,6 +51,11 @@ pub struct Scroller {
     step_px: i32,
     /// Where the user had the document before we touched it.
     start_percent: f64,
+    /// The position the last step asked for.  Chromium reports its scroll
+    /// percentage late — a read right after a step can still return the old
+    /// value — so a step that trusted that read alone would ask for the same
+    /// target twice, see nothing move, and end the capture a few screens in.
+    asked: Cell<f64>,
 }
 
 impl Scroller {
@@ -146,6 +152,7 @@ impl Scroller {
                 step_percent,
                 step_px: target_px,
                 start_percent,
+                asked: Cell::new(start_percent),
             })
         }
     }
@@ -160,9 +167,13 @@ impl Scroller {
     /// means the document was already at the bottom.
     pub fn step(&self) -> bool {
         unsafe {
-            let Ok(current) = self.pattern.CurrentVerticalScrollPercent() else {
+            let Ok(reported) = self.pattern.CurrentVerticalScrollPercent() else {
                 return false;
             };
+            // Never step from behind the last target: a stale report would
+            // send us back to where we already are.  The frames are still the
+            // authority on how far the content really moved.
+            let current = reported.max(self.asked.get());
             if current >= 100.0 - END_EPS {
                 return false;
             }
@@ -175,8 +186,9 @@ impl Scroller {
             {
                 return false;
             }
+            self.asked.set(target);
 
-            self.settle();
+            self.settle(reported, target);
             println!(
                 "[uia] {current:.2}% -> asked {target:.2}%, landed {:.2}%",
                 self.pattern.CurrentVerticalScrollPercent().unwrap_or(-1.0)
@@ -185,19 +197,28 @@ impl Scroller {
         }
     }
 
-    /// Polls the position until it stops changing.  Smooth-scroll animations
-    /// vary wildly in length between apps, and this replaces guessing at a
-    /// fixed delay long enough to cover the slowest of them.
-    unsafe fn settle(&self) {
+    /// Waits for the scroll that just started to come to rest: first for the
+    /// reported position to leave `from` (or reach `target`), then for it to
+    /// stop changing.  Smooth-scroll animations vary wildly in length between
+    /// apps, and this replaces guessing at a fixed delay long enough to cover
+    /// the slowest of them.
+    ///
+    /// The first half matters: Chromium's position lags the scroll by a poll
+    /// or two, and two equal reads of the *old* value used to count as "at
+    /// rest" before anything had moved.
+    unsafe fn settle(&self, from: f64, target: f64) {
         unsafe {
             let deadline = Instant::now() + SETTLE_TIMEOUT;
             let mut last = f64::NAN;
+            let mut moved = false;
             while Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(POLL_MS));
                 let Ok(now) = self.pattern.CurrentVerticalScrollPercent() else {
                     break;
                 };
-                if now == last {
+                if !moved {
+                    moved = (now - from).abs() > 1e-6 || (now - target).abs() < 1e-3;
+                } else if now == last {
                     break;
                 }
                 last = now;

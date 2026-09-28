@@ -96,28 +96,46 @@ system tray with a ~20 MB memory footprint.
   - **Any installed layout variant** — read from Windows itself, so "Russian
     (Ukraine)", Ukrainian (Enhanced) with `ґ` on its own key, or a UK English
     board all work. Classic password boxes are left alone.
-- **Ask the model** — `Ctrl+Tab` drops a single input line in the middle of the
-  screen. Type, press Enter, and the answer unfolds underneath while the input
-  stays where it was; the window height follows the reply, so a one-word answer
-  doesn't leave a half-empty panel and a long one scrolls. No caption, no
-  buttons — Escape dismisses it, so does clicking into anything else, and so
-  does pressing the hotkey again. Whatever text is selected when the hotkey is
-  pressed arrives already in the input, unsent, so a question can be asked
-  *about* something without pasting it first. Follow-ups keep the thread, and
+- **Ask the model** *(off by default — switch it on in Settings → Ask AI;
+  while it's off, its hotkey isn't registered at all)* — `Ctrl+Tab` drops a
+  single input line beside the text you
+  have selected, or in the middle of the screen when nothing is. Type, press
+  Enter, and the answer unfolds underneath while the input stays where it was;
+  the window height follows the reply, so a one-word answer doesn't leave a
+  half-empty panel and a long one scrolls. No caption, no buttons — drag it
+  anywhere by the panel around the fields, and dismiss it with Escape or the
+  hotkey again. Clicking into another window leaves it alone, so an answer can
+  stay on screen while you work underneath it. Whatever text is selected when
+  the hotkey is pressed arrives already in the input, unsent, so a question can
+  be asked *about* something without pasting it first. Follow-ups keep the thread, and
   it answers in the current UI language, since a hotkey leaves no room to ask
   for one. The conversation lives only as long as the window: reopening starts
   clean.
+  - **It has eyes.** Paste a picture into it and the question is asked about
+    that: a thumbnail appears beside the input, and clicking the thumbnail takes
+    it back off. With a Claude API key set, the picture is sent to the model as
+    a picture — it can read a chart, a diagram, or an interface. Without one,
+    the window falls back to OCR: it reads the text out of the image locally and
+    hands that to DeepSeek, which covers a screenshot of an error, a document or
+    a page of code, but cannot describe what is *drawn*. Which backend answers
+    is decided by the picture alone — a question with no image always goes to
+    DeepSeek, whether or not the second key is set.
 - **Taskbar icon centering** — dynamically repositions icons to the middle
   of the taskbar and keeps them centered as icons come and go.
-- **System tray** — left-click opens settings, right-click shows a
-  "Settings / Exit" menu. The console window is hidden.
+- **System tray** — its own icon; left-click opens settings, right-click shows
+  a dark "Settings / Exit" menu. The console window is hidden.
 - **Multi-language UI** — settings, popup, and tray menu translated into
   13 languages (en, ru, es, fr, de, pt, it, pl, tr, uk, zh, ja, ko).
-- **macOS-style interface** — grouped inset cards, switches instead of
-  checkboxes, secondary-colour group titles, and a dark title bar. Every
-  rounded shape is drawn at 4× into an off-screen buffer and filtered back
-  down: GDI has no antialiasing, and a stair-stepped corner is the one thing
-  that gives a hand-drawn control away.
+- **Modern dark interface** — a frameless settings window with a navigation
+  column (General / Shortcuts / Translation / Ask AI) instead of one long
+  scroll; grouped cards, switches, keycap-style shortcut fields, and API keys
+  masked until you click the eye, each with a live "works / rejected /
+  unreachable" status. The translation popup and dropdowns are floating cards
+  with antialiased corners and a soft shadow (per-pixel-alpha layered
+  windows); the capture overlay keeps its tools and actions in one bar under
+  the selection. Every rounded shape is antialiased — GDI has none of its own,
+  and a stair-stepped corner is the one thing that gives a hand-drawn control
+  away.
 - **Windows autostart** — optional one-click toggle that writes to
   `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
 
@@ -133,7 +151,7 @@ system tray with a ~20 MB memory footprint.
 | `Ctrl+Alt+L` | Switch the layout of the word just typed, or of the selection |
 | `Pause` | Take back the last automatic correction (or convert the last word) |
 | `Ctrl+Alt+A` | Turn automatic layout correction on or off |
-| `Ctrl+Tab` | Ask the model a question |
+| `Ctrl+Tab` | Ask the model a question (only once turned on in settings) |
 
 Inside the capture overlay, once a region is selected:
 
@@ -146,9 +164,10 @@ Inside the capture overlay, once a region is selected:
 
 All hotkeys are remappable from the settings window (click the tray icon).
 
-> `Ctrl+Tab` is registered globally, which takes it away from every other
-> application while the app runs — browsers and editors included. Remap it in
-> settings if you want tab switching back.
+> Once the ask window is on, `Ctrl+Tab` is registered globally, which takes it
+> away from every other application while the app runs — browsers and editors
+> included. Remap it in settings if you want tab switching back; with the ask
+> window off it isn't taken at all.
 
 ---
 
@@ -201,14 +220,78 @@ packs to be installed in Windows).
    scrollable area and click **Full page**. Keep hands off the mouse and
    keyboard while it scrolls; when it stops, a save dialog offers the
    stitched PNG.
-6. To mark something up, pick the pencil or the rectangle from the strip beside
-   the selection and drag inside it, then save or copy as usual.
-7. Press `Ctrl+Tab`, type a question, press `Enter`. Select text first and it
+6. To mark something up, pick the pencil or the rectangle at the left of the
+   bar under the selection and drag inside it, then save or copy as usual.
+7. Turn the ask window on in Settings → Ask AI, then press `Ctrl+Tab`, type a
+   question, press `Enter`. Select text first and it
    is waiting in the input when the window opens. `Shift+Enter` breaks the line
-   instead of sending; `Esc`, a click elsewhere, or the hotkey again closes the
-   window. Requires a DeepSeek key.
+   instead of sending; `Esc` or the hotkey again closes the window. `Ctrl+V`
+   attaches a picture from the clipboard instead of pasting text. Requires a
+   DeepSeek key; a Claude key is what lets it see the picture rather than just
+   read the text out of it.
 8. Click the tray icon to open settings: remap hotkeys, pick a screenshot
-   folder, toggle Punto / taskbar centering / autostart.
+   folder, toggle Punto / taskbar centering / autostart / the ask window.
+   `Tab` moves between fields, `Ctrl+Tab` between pages, `Enter` saves,
+   `Esc` closes.
+
+---
+
+## Chrome extension: full-page screenshot, save image as PNG / JPG / WebP
+
+The extension in `chrome_extension/` does two things.
+
+**Screenshot the whole page** — the toolbar button, `Ctrl+Shift+S`, or
+**Screenshot the whole page** in the page's right-click menu. The page is
+captured top to bottom in one go, wherever you are scrolled, without
+scrolling through it: Chrome renders the parts that are off screen itself
+(DevTools protocol, `captureBeyondViewport`). A long page takes about a
+second. The PNG goes straight to Downloads, named after the page title.
+
+- While it runs (a second or so) Chrome shows its *"… started debugging this
+  browser"* bar. That's how Chrome labels any use of the protocol, and it
+  can't be switched off from an extension.
+- Sticky headers come out once, at the top: the page is put at the top for
+  the capture — instantly, not scrolled — and put back afterwards.
+- Images marked `loading="lazy"` are loaded before the capture. Content a
+  script only adds as you scroll (infinite feeds) isn't there to capture.
+- Pages that scroll an inner panel instead of the page itself (web mail,
+  chat apps) come out as one screen; the exe's **Full page** button handles
+  those by scrolling.
+- Pages taller than 32 000 px are cut there — the largest canvas Chrome
+  will encode.
+- `chrome://` pages and the Web Store can't be captured by any extension.
+
+**Save image as PNG / JPG / WebP.** Chrome's own **Save image as…** writes
+whatever the site served — mostly WebP or AVIF — and the type box in its dialog
+can't change that. The extension adds a **Save image as → PNG… / JPG… /
+WebP…** submenu to the right-click menu on images. It re-encodes the picture
+and then opens the ordinary Save As dialog with the right extension already in
+the file name.
+
+It is separate from the exe; no program outside the browser can add entries to
+that menu, or render a page it hasn't painted.
+
+**Install** (Chrome or Edge):
+
+1. Open `chrome://extensions` (`edge://extensions`) and turn on
+   **Developer mode**.
+2. Click **Load unpacked** and pick the `chrome_extension` folder. Chrome loads
+   it from there, so leave the folder where it is. After updating the folder,
+   press the reload arrow on the extension's card.
+3. If `Ctrl+Shift+S` is taken by something else, pick another key at
+   `chrome://extensions/shortcuts`.
+
+**Behaviour worth knowing:**
+
+- JPG is written at quality 92; transparent areas become white, since JPEG has
+  no alpha. PNG and WebP keep transparency.
+- Animated GIF and WebP are saved as their first frame. SVG is rasterised at
+  its own declared size.
+- The image is fetched again by the extension, which is why it asks for access
+  to all sites: pictures usually live on a CDN, not on the page's domain.
+  Hotlink-protected images and `blob:` images are read from inside the page
+  instead.
+- If the image can't be fetched or decoded, the page shows an alert saying so.
 
 ---
 
@@ -219,6 +302,7 @@ packs to be installed in Windows).
 - [`ureq`](https://crates.io/crates/ureq) — HTTP client
 - [`serde`](https://crates.io/crates/serde) + `serde_json` — settings persistence
 - [`base64`](https://crates.io/crates/base64) — image encoding for OCR.space
+  and for the vision API
 - [`chrono`](https://crates.io/crates/chrono) — screenshot filename timestamps
 - [`anyhow`](https://crates.io/crates/anyhow) — error handling
 
@@ -226,6 +310,8 @@ External services used:
 - MyMemory Translation API (free, no key required) — default translator
 - DeepSeek Chat Completions API (paid, optional) — higher-quality
   alternative; configure the key in the settings window
+- Anthropic Messages API (paid, optional) — what the ask window uses to look
+  at an attached picture; without a key it falls back to OCR
 - OCR.space Parse Image API (free, optional key)
 
 ---
@@ -236,7 +322,7 @@ External services used:
 src/
 ├── main.rs            # entry point, main message loop, hotkey dispatch
 ├── settings.rs        # settings model, JSON load/save
-├── settings_ui.rs     # custom owner-drawn dark settings window
+├── settings_ui.rs     # frameless dark settings window with page navigation
 ├── tray.rs            # system tray icon (Shell_NotifyIcon)
 ├── autostart.rs       # Windows Registry Run key for autostart
 ├── autotype/          # Punto-style layout correction
@@ -254,6 +340,7 @@ src/
 ├── ocr.rs             # OCR.space + WinRT OCR
 ├── translate.rs       # translation policy: DeepSeek or MyMemory, language detection
 ├── deepseek.rs        # DeepSeek chat-completions client, shared by both callers
+├── vision.rs          # Anthropic messages client — the ask window's eyes
 ├── ask.rs             # "ask the model" chat window
 ├── popup.rs           # translation result popup window
 ├── i18n.rs            # 13-language UI string table
@@ -264,6 +351,13 @@ src/
 
 data/punto/            # word models, built by tools/build_punto_dicts.py
 tools/                 # the dictionary builder (downloads its corpora)
+
+chrome_extension/      # "Save image as PNG / JPG / WebP" for Chrome and Edge
+├── manifest.json
+├── background.js      # context menu, fetch fallbacks, Save As dialog
+├── offscreen.js       # decode and re-encode; owns the blob: URLs
+├── offscreen.html
+└── _locales/          # en, ru, uk
 ```
 
 ---

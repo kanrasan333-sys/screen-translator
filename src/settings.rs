@@ -32,6 +32,25 @@ pub struct Settings {
     /// instead of the free MyMemory API.
     #[serde(default = "String::new")]
     pub deepseek_api_key: String,
+    /// Gemini API key. Used by the ask window for everything it does — answering
+    /// text, looking at an attached image, and searching the web. Independent of
+    /// the DeepSeek key above, which only drives translation.
+    #[serde(default = "String::new")]
+    pub gemini_api_key: String,
+    /// Tavily API key. With it set, the ask window searches the web itself and
+    /// hands the results to the model — Gemini's own grounding is paid-tier only.
+    #[serde(default = "String::new")]
+    pub search_api_key: String,
+    /// Whether the ask window may search the web at all.  Toggled from the
+    /// window itself: plenty of questions need no internet, and the list of
+    /// sources under every answer is noise when they don't.
+    #[serde(default = "yes")]
+    pub web_search: bool,
+    /// Whether the ask window exists at all.  Off by default: while it's off
+    /// its hotkey isn't registered, so the combination stays free for every
+    /// other app on the machine.  The keys above are kept either way.
+    #[serde(default)]
+    pub ask_enabled: bool,
 }
 
 fn yes() -> bool {
@@ -88,6 +107,10 @@ impl Settings {
         taskbar_center_enabled: true,
         language: String::new(), // filled with "en" on load if missing
         deepseek_api_key: String::new(),
+        gemini_api_key: String::new(),
+        search_api_key: String::new(),
+        web_search: true,
+        ask_enabled: false,
     };
 }
 

@@ -33,7 +33,7 @@ system tray with a ~20 MB memory footprint.
 - **Two translation backends** — by default uses the free
   [MyMemory](https://mymemory.translated.net/) API (no key required);
   if a DeepSeek API key is set in settings, the much higher-quality
-  `deepseek-chat` model is used instead, with automatic fallback to
+  `deepseek-flash` model is used instead, with automatic fallback to
   MyMemory on any error.
 - **Region OCR + translation** — draw a rectangle with the mouse, the
   captured pixels are recognized via [OCR.space](https://ocr.space/) (primary

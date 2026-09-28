@@ -926,6 +926,21 @@ unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                     let _ = SetCursor(LoadCursorW(None, h.cursor()).unwrap_or_default());
                     return LRESULT(1);
                 }
+                // The dock: a hand over its buttons, the plain arrow over its
+                // padding — the crosshair would promise a selection there.
+                if phase == Phase::Toolbar {
+                    let mut pt = POINT::default();
+                    if GetCursorPos(&mut pt).is_ok() {
+                        let _ = ScreenToClient(hwnd, &mut pt);
+                        let dock = dock_layout(rx, ry, rw, rh);
+                        if point_in_rect(pt.x, pt.y, &dock.rc) {
+                            let on_button = dock.tools.iter().chain(&dock.btns).any(|b| point_in_btn(pt.x, pt.y, b));
+                            let cursor = if on_button { IDC_HAND } else { IDC_ARROW };
+                            let _ = SetCursor(LoadCursorW(None, cursor).unwrap_or_default());
+                            return LRESULT(1);
+                        }
+                    }
+                }
                 // With a tool armed the handles are dead, so promising a
                 // resize with the cursor would be a lie — a drag there draws.
                 if phase == Phase::Toolbar && tool == Tool::None {

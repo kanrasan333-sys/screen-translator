@@ -1114,6 +1114,12 @@ unsafe extern "system" fn button_hover_proc(
             // The owner draw covers every pixel; letting the class erase
             // first is what makes owner-drawn buttons flicker.
             WM_ERASEBKGND => return LRESULT(1),
+            // Answered here rather than passed on: the class's default asks
+            // the parent first, and the parent only speaks for itself.
+            WM_SETCURSOR => {
+                SetCursor(LoadCursorW(None, IDC_HAND).unwrap_or_default());
+                return LRESULT(1);
+            }
             _ => {}
         }
         let orig = *BUTTON_PROC.lock().unwrap();
@@ -2054,6 +2060,36 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 LRESULT(0)
             }
 
+            // A hand over what the window paints and handles itself — the
+            // pages and the close button — and a text cursor over a field's
+            // padding, which a click also lands in.  Only for the window's own
+            // client area: children forward WM_SETCURSOR here first, and
+            // answering for them would override their cursors.
+            WM_SETCURSOR
+                if wp.0 == hwnd.0 as usize && (lp.0 & 0xFFFF) as u32 == HTCLIENT =>
+            {
+                let mut pt = POINT::default();
+                let _ = GetCursorPos(&mut pt);
+                let _ = ScreenToClient(hwnd, &mut pt);
+                let cursor = if hover_at(pt.x, pt.y) != Hover::None {
+                    Some(IDC_HAND)
+                } else if field_frames(current_page())
+                    .iter()
+                    .any(|(_, rc)| contains(rc, pt.x, pt.y))
+                {
+                    Some(IDC_IBEAM)
+                } else {
+                    None
+                };
+                match cursor {
+                    Some(c) => {
+                        SetCursor(LoadCursorW(None, c).unwrap_or_default());
+                        LRESULT(1)
+                    }
+                    None => DefWindowProcW(hwnd, msg, wp, lp),
+                }
+            }
+
             WM_MOUSEMOVE => {
                 let (x, y) = ((lp.0 & 0xFFFF) as i16 as i32, (lp.0 >> 16) as i16 as i32);
                 set_hover(hwnd, hover_at(x, y));
@@ -2662,6 +2698,10 @@ unsafe extern "system" fn lang_popup_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
             WM_ERASEBKGND => LRESULT(1),
             WM_MOUSEMOVE => {
                 let hover = lang_item_at(hwnd, lp).unwrap_or(usize::MAX);
+                // The list holds mouse capture, and a window with capture gets
+                // no WM_SETCURSOR — so the cursor is set here, on every move.
+                let cursor = if hover == usize::MAX { IDC_ARROW } else { IDC_HAND };
+                SetCursor(LoadCursorW(None, cursor).unwrap_or_default());
                 let changed = lang_popup_state(hwnd).is_some_and(|s| {
                     let c = s.hover != hover;
                     s.hover = hover;

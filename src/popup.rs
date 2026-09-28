@@ -6,8 +6,10 @@
 //! shadow — so there is no `WM_PAINT` path: every change of content, hover or
 //! fade re-renders the card and hands it to `UpdateLayeredWindow`.
 
+use crate::i18n;
 use crate::paint;
 use crate::theme;
+use crate::translate::{Engine, FallbackReason};
 use crate::utils::lparam_to_point;
 use std::sync::Mutex;
 use windows::Win32::Foundation::*;
@@ -60,8 +62,17 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 static POPUP_RAW: Mutex<isize> = Mutex::new(0);
 static CURRENT_ALPHA: Mutex<u8> = Mutex::new(0);
 static SPINNER_ANGLE: Mutex<i32> = Mutex::new(0);
-static COPY_HOVER: Mutex<bool> = Mutex::new(false);
-static COPY_DONE: Mutex<bool> = Mutex::new(false);
+/// The card has two copy buttons: one for the translation, one for the text
+/// it came from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CopyTarget {
+    Translated,
+    Original,
+}
+/// The copy button under the pointer, and the one that just copied (it shows
+/// a tick for a moment).
+static COPY_HOVER: Mutex<Option<CopyTarget>> = Mutex::new(None);
+static COPY_DONE: Mutex<Option<CopyTarget>> = Mutex::new(None);
 /// Where the card's top-left sits on screen.
 static CARD_POS: Mutex<(i32, i32)> = Mutex::new((0, 0));
 
@@ -77,6 +88,8 @@ struct PopupText {
     original: String,
     direction: String,
     loading: bool,
+    /// Which service made the translation, for the chip beside the languages.
+    engine: Option<Engine>,
 }
 static POPUP_TEXT: Mutex<Option<PopupText>> = Mutex::new(None);
 
@@ -119,6 +132,7 @@ pub fn init() {
             original: String::new(),
             direction: String::new(),
             loading: false,
+            engine: None,
         });
         if let Some(hwnd) = create_popup() {
             store_hwnd(&POPUP_RAW, hwnd);
@@ -128,8 +142,8 @@ pub fn init() {
 }
 
 pub fn show_loading(msg: &str) {
-    set_popup_text(msg, "", "", true);
-    *COPY_DONE.lock().unwrap() = false;
+    set_popup_text(msg, "", "", true, None);
+    *COPY_DONE.lock().unwrap() = None;
 
     unsafe {
         if let Some(hwnd) = load_hwnd(&POPUP_RAW) {
@@ -150,12 +164,18 @@ pub fn show_loading(msg: &str) {
     }
 }
 
+/// Shows a status message or an error: anything that isn't a translation.
 pub fn show(original: &str, translated: &str, direction: &str) {
+    show_translation(original, translated, direction, None);
+}
+
+/// Shows a translation, with the service that made it.
+pub fn show_translation(original: &str, translated: &str, direction: &str, engine: Option<Engine>) {
     let was_loading = is_loading();
 
-    set_popup_text(translated, original, direction, false);
-    *COPY_DONE.lock().unwrap() = false;
-    *COPY_HOVER.lock().unwrap() = false;
+    set_popup_text(translated, original, direction, false, engine);
+    *COPY_DONE.lock().unwrap() = None;
+    *COPY_HOVER.lock().unwrap() = None;
 
     unsafe {
         if let Some(hwnd) = load_hwnd(&POPUP_RAW) {
@@ -188,12 +208,19 @@ pub fn show(original: &str, translated: &str, direction: &str) {
 // Helpers
 // ============================================================
 
-fn set_popup_text(translated: &str, original: &str, direction: &str, loading: bool) {
+fn set_popup_text(
+    translated: &str,
+    original: &str,
+    direction: &str,
+    loading: bool,
+    engine: Option<Engine>,
+) {
     *POPUP_TEXT.lock().unwrap() = Some(PopupText {
         translated: translated.to_string(),
         original: original.to_string(),
         direction: direction.to_string(),
         loading,
+        engine,
     });
 }
 
@@ -268,7 +295,13 @@ struct Layout {
     kind: Kind,
     /// Header row — only a translation has one.
     chip_rect: RECT,
+    /// The service chip beside the languages, and the note after it when
+    /// DeepSeek fell through to MyMemory.
+    engine_rect: RECT,
+    engine_note_rect: RECT,
     copy_btn_rect: RECT,
+    /// Copy button beside the original text.
+    copy_orig_rect: RECT,
     icon_rect: RECT,
     text_rect: RECT,
     separator_y: i32,
@@ -290,6 +323,8 @@ fn calc_layout(hdc: HDC) -> Layout {
 
     let mut y = PAD_Y;
     let mut chip_rect = RECT::default();
+    let mut engine_rect = RECT::default();
+    let mut engine_note_rect = RECT::default();
     let mut copy_btn_rect = RECT::default();
     let mut icon_rect = RECT::default();
 
@@ -328,6 +363,28 @@ fn calc_layout(hdc: HDC) -> Layout {
                     right: CARD_W - PAD_X + 6,
                     bottom: y + (HEADER_H - COPY_BTN_H) / 2 + COPY_BTN_H,
                 };
+            }
+            if let Some(engine) = text.engine {
+                let engine_font = theme::ui_font(FONT_CHIP, 600);
+                let (ew, _) = unsafe { theme::measure(hdc, engine_name(engine), engine_font) };
+                engine_rect = RECT {
+                    left: chip_rect.right + 6,
+                    right: chip_rect.right + 6 + ew + 16,
+                    ..chip_rect
+                };
+                if engine_note(engine).is_some() {
+                    let right = if show_copy {
+                        copy_btn_rect.left - 6
+                    } else {
+                        CARD_W - PAD_X
+                    };
+                    engine_note_rect = RECT {
+                        left: engine_rect.right + 8,
+                        top: y,
+                        right,
+                        bottom: y + HEADER_H,
+                    };
+                }
             }
             y += HEADER_H + HEADER_GAP;
             let h = unsafe { theme::measure_wrapped(hdc, &text.translated, main_font, inner_w) }
@@ -384,15 +441,26 @@ fn calc_layout(hdc: HDC) -> Layout {
         }
     };
 
+    // The original, with its own copy button beside its first line; the
+    // text stops short of the button rather than running under it.
+    let mut copy_orig_rect = RECT::default();
     let (separator_y, original_rect) = if has_original {
         y += 12;
         let sep = y;
         y += 12;
-        let h = unsafe { theme::measure_wrapped(hdc, &text.original, small_font, inner_w) }.max(16);
+        let right = CARD_W - PAD_X - COPY_BTN_W - 4;
+        let h = unsafe { theme::measure_wrapped(hdc, &text.original, small_font, right - PAD_X) }
+            .max(16);
+        copy_orig_rect = RECT {
+            left: CARD_W - PAD_X - COPY_BTN_W + 6,
+            top: y - 5,
+            right: CARD_W - PAD_X + 6,
+            bottom: y - 5 + COPY_BTN_H,
+        };
         let r = RECT {
             left: PAD_X,
             top: y,
-            right: CARD_W - PAD_X,
+            right,
             bottom: y + h,
         };
         y += h;
@@ -407,13 +475,29 @@ fn calc_layout(hdc: HDC) -> Layout {
         total_h: y.min(MAX_CARD_H),
         kind,
         chip_rect,
+        engine_rect,
+        engine_note_rect,
         copy_btn_rect,
+        copy_orig_rect,
         icon_rect,
         text_rect,
         separator_y,
         original_rect,
         has_original,
         show_copy,
+    }
+}
+
+impl Layout {
+    /// The copy button at a point in card coordinates, if any.
+    fn copy_at(&self, x: i32, y: i32) -> Option<CopyTarget> {
+        if self.show_copy && point_in_rect(x, y, &self.copy_btn_rect) {
+            Some(CopyTarget::Translated)
+        } else if self.has_original && point_in_rect(x, y, &self.copy_orig_rect) {
+            Some(CopyTarget::Original)
+        } else {
+            None
+        }
     }
 }
 
@@ -430,16 +514,19 @@ unsafe fn layout_now(hwnd: HWND) -> Layout {
 // Copy-to-clipboard action
 // ============================================================
 
-fn copy_translated(hwnd: HWND) {
+fn copy_text(hwnd: HWND, which: CopyTarget) {
     let text = POPUP_TEXT.lock().unwrap();
     if let Some(t) = text.as_ref() {
-        if !t.translated.is_empty() {
-            let s = t.translated.clone();
-            drop(text);
+        let s = match which {
+            CopyTarget::Translated => t.translated.clone(),
+            CopyTarget::Original => t.original.clone(),
+        };
+        drop(text);
+        if !s.is_empty() {
             if let Ok(mut cb) = arboard::Clipboard::new() {
                 let _ = cb.set_text(&s);
             }
-            *COPY_DONE.lock().unwrap() = true;
+            *COPY_DONE.lock().unwrap() = Some(which);
             unsafe {
                 present(hwnd);
                 let _ = SetTimer(hwnd, TIMER_COPY_RESET, 1500, None);
@@ -588,7 +675,7 @@ unsafe extern "system" fn popup_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
                     TIMER_AUTOHIDE => hide_popup(hwnd),
                     TIMER_COPY_RESET => {
                         let _ = KillTimer(hwnd, TIMER_COPY_RESET);
-                        *COPY_DONE.lock().unwrap() = false;
+                        *COPY_DONE.lock().unwrap() = None;
                         present(hwnd);
                     }
                     _ => {}
@@ -597,12 +684,23 @@ unsafe extern "system" fn popup_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             }
             // A card never takes focus from the window being read.
             WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+            // A hand over the copy buttons.
+            WM_SETCURSOR => {
+                let mut pt = POINT::default();
+                let _ = GetCursorPos(&mut pt);
+                let _ = ScreenToClient(hwnd, &mut pt);
+                let (x, y) = (pt.x - paint::CARD_MARGIN, pt.y - paint::CARD_MARGIN);
+                if !is_loading() && layout_now(hwnd).copy_at(x, y).is_some() {
+                    SetCursor(LoadCursorW(None, IDC_HAND).unwrap_or_default());
+                    return LRESULT(1);
+                }
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
             WM_LBUTTONDOWN => {
                 if !is_loading() {
                     let (x, y) = to_card(lp);
-                    let layout = layout_now(hwnd);
-                    if layout.show_copy && point_in_rect(x, y, &layout.copy_btn_rect) {
-                        copy_translated(hwnd);
+                    if let Some(which) = layout_now(hwnd).copy_at(x, y) {
+                        copy_text(hwnd, which);
                     }
                 }
                 LRESULT(0)
@@ -610,8 +708,7 @@ unsafe extern "system" fn popup_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             WM_MOUSEMOVE => {
                 if !is_loading() {
                     let (x, y) = to_card(lp);
-                    let layout = layout_now(hwnd);
-                    let hover = layout.show_copy && point_in_rect(x, y, &layout.copy_btn_rect);
+                    let hover = layout_now(hwnd).copy_at(x, y);
                     let old = std::mem::replace(&mut *COPY_HOVER.lock().unwrap(), hover);
                     if hover != old {
                         present(hwnd);
@@ -630,7 +727,7 @@ unsafe extern "system" fn popup_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
                 LRESULT(0)
             }
             WM_MOUSELEAVE => {
-                if std::mem::replace(&mut *COPY_HOVER.lock().unwrap(), false) {
+                if std::mem::replace(&mut *COPY_HOVER.lock().unwrap(), None).is_some() {
                     present(hwnd);
                 }
                 LRESULT(0)
@@ -778,6 +875,9 @@ unsafe fn paint_content(hdc: HDC, layout: &Layout) {
                     theme::lighten(theme::CLR_ACCENT, 70),
                     theme::DT_CENTER_VCENTER,
                 );
+                if let Some(engine) = text.engine {
+                    draw_engine(hdc, engine, &layout.engine_rect, &layout.engine_note_rect);
+                }
             }
             Kind::Info => theme::glyph(
                 hdc,
@@ -808,13 +908,11 @@ unsafe fn paint_content(hdc: HDC, layout: &Layout) {
             flags,
         );
 
+        let hover = *COPY_HOVER.lock().unwrap();
+        let done = *COPY_DONE.lock().unwrap();
         if layout.show_copy {
-            draw_copy_button(
-                hdc,
-                &layout.copy_btn_rect,
-                *COPY_HOVER.lock().unwrap(),
-                *COPY_DONE.lock().unwrap(),
-            );
+            let t = Some(CopyTarget::Translated);
+            draw_copy_button(hdc, &layout.copy_btn_rect, hover == t, done == t);
         }
 
         if layout.has_original {
@@ -833,6 +931,8 @@ unsafe fn paint_content(hdc: HDC, layout: &Layout) {
                 theme::CLR_TEXT_DIM,
                 theme::DT_WRAP,
             );
+            let o = Some(CopyTarget::Original);
+            draw_copy_button(hdc, &layout.copy_orig_rect, hover == o, done == o);
         }
     }
 }
@@ -900,6 +1000,67 @@ unsafe fn draw_copy_button(hdc: HDC, rc: &RECT, hover: bool, done: bool) {
                 theme::CLR_TEXT_DIM
             };
             theme::glyph(hdc, theme::ICON_COPY, rc, 14, color);
+        }
+    }
+}
+
+// ============================================================
+// Which service translated
+// ============================================================
+
+fn engine_name(engine: Engine) -> &'static str {
+    match engine {
+        Engine::DeepSeek => "DeepSeek",
+        Engine::MyMemory | Engine::Fallback(_) => "MyMemory",
+    }
+}
+
+/// Why DeepSeek didn't answer, when it was supposed to.  Worth saying: only
+/// DeepSeek reads through typos, so a MyMemory translation of hurried text can
+/// be worse, and each reason has a different fix.
+fn engine_note(engine: Engine) -> Option<String> {
+    let Engine::Fallback(reason) = engine else {
+        return None;
+    };
+    Some(match reason {
+        FallbackReason::KeyRejected => format!("DeepSeek: {}", i18n::t("settings.key.rejected")),
+        FallbackReason::NoBalance => i18n::t("popup.deepseek_no_balance").to_string(),
+        FallbackReason::Unavailable => i18n::t("settings.key.offline").to_string(),
+    })
+}
+
+/// The service chip: neutral when things went as configured, orange with the
+/// reason after it when DeepSeek fell through to MyMemory.
+unsafe fn draw_engine(hdc: HDC, engine: Engine, chip: &RECT, note_rc: &RECT) {
+    unsafe {
+        let fell_back = matches!(engine, Engine::Fallback(_));
+        let (fill, fg) = if fell_back {
+            (
+                theme::mix(theme::CLR_ELEVATED, theme::CLR_ORANGE, 55),
+                theme::lighten(theme::CLR_ORANGE, 40),
+            )
+        } else {
+            (theme::mix(theme::CLR_ELEVATED, theme::CLR_TEXT_DIM, 45), theme::CLR_TEXT)
+        };
+        let h = chip.bottom - chip.top;
+        paint::round_rect(hdc, chip, &paint::Style::flat(h / 2, fill));
+        theme::text(
+            hdc,
+            engine_name(engine),
+            chip,
+            theme::ui_font(FONT_CHIP, 600),
+            fg,
+            theme::DT_CENTER_VCENTER,
+        );
+        if let Some(note) = engine_note(engine) {
+            theme::text(
+                hdc,
+                &note,
+                note_rc,
+                theme::ui_font(FONT_CHIP + 1, 400),
+                theme::CLR_ORANGE,
+                theme::DT_LEFT_VCENTER | theme::DT_ELLIPSIS,
+            );
         }
     }
 }

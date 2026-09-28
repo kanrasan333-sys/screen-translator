@@ -1353,6 +1353,22 @@ static ENTRIES: &[Entry] = &[
         ja: "ショートカット",
         ko: "단축키",
     },
+    Entry {
+        key: "popup.deepseek_no_balance",
+        en: "DeepSeek: balance ran out",
+        ru: "DeepSeek: закончился баланс",
+        es: "DeepSeek: sin saldo",
+        fr: "DeepSeek\u{A0}: solde \u{E9}puis\u{E9}",
+        de: "DeepSeek: Guthaben aufgebraucht",
+        pt: "DeepSeek: saldo esgotado",
+        it: "DeepSeek: credito esaurito",
+        pl: "DeepSeek: brak \u{15B}rodk\u{F3}w",
+        tr: "DeepSeek: bakiye bitti",
+        uk: "DeepSeek: закінчився баланс",
+        zh: "DeepSeek：余额不足",
+        ja: "DeepSeek：残高不足",
+        ko: "DeepSeek: 잔액 부족",
+    },
 ];
 
 // ============================================================

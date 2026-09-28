@@ -5,28 +5,64 @@ use crate::utils::{truncate, urlencode};
 use anyhow::{Result, anyhow};
 use serde::Deserialize;
 
+/// Which service produced a translation — shown on the popup, because the
+/// two are not alike: DeepSeek reads through typos and wrong-layout text,
+/// MyMemory translates the letters it's given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Engine {
+    DeepSeek,
+    /// No DeepSeek key set.
+    MyMemory,
+    /// A DeepSeek key is set, but DeepSeek didn't answer; MyMemory did.
+    Fallback(FallbackReason),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FallbackReason {
+    KeyRejected,
+    NoBalance,
+    /// Network, timeout, server error — anything that isn't the account.
+    Unavailable,
+}
+
+pub struct Translation {
+    pub text: String,
+    /// "en -> ru".
+    pub direction: String,
+    pub engine: Engine,
+}
+
 /// Translates text. Uses DeepSeek if an API key is configured, otherwise
-/// falls back to the free MyMemory API. Returns `(translation, direction)`.
-pub fn translate(text: &str) -> Result<(String, String)> {
+/// falls back to the free MyMemory API.
+pub fn translate(text: &str) -> Result<Translation> {
     let (from, to) = detect_direction(text);
     let direction = format!("{from} -> {to}");
 
     let key = settings::current().deepseek_api_key;
     let key = key.trim();
 
-    let translated = if !key.is_empty() {
+    let (translated, engine) = if !key.is_empty() {
         match translate_deepseek(text, from, to, key) {
-            Ok(t) => t,
+            Ok(t) => (t, Engine::DeepSeek),
             Err(e) => {
                 println!("[translate] DeepSeek ошибка, fallback на MyMemory: {e}");
-                translate_mymemory(text, from, to)?
+                let reason = match e.downcast_ref::<deepseek::Refusal>() {
+                    Some(deepseek::Refusal::KeyRejected) => FallbackReason::KeyRejected,
+                    Some(deepseek::Refusal::NoBalance) => FallbackReason::NoBalance,
+                    None => FallbackReason::Unavailable,
+                };
+                (translate_mymemory(text, from, to)?, Engine::Fallback(reason))
             }
         }
     } else {
-        translate_mymemory(text, from, to)?
+        (translate_mymemory(text, from, to)?, Engine::MyMemory)
     };
 
-    Ok((translated, direction))
+    Ok(Translation {
+        text: translated,
+        direction,
+        engine,
+    })
 }
 
 // ============================================================

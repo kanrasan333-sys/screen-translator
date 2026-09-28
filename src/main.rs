@@ -74,6 +74,9 @@ struct TranslationResult {
     translated: String,
     direction: String,
     is_error: bool,
+    /// Which service translated it — shown on the popup.  None for anything
+    /// that isn't a translation.
+    engine: Option<translate::Engine>,
 }
 static PENDING_RESULT: Mutex<Option<TranslationResult>> = Mutex::new(None);
 
@@ -175,7 +178,7 @@ fn run_main_loop() {
             // Deliver background translation result to the popup.
             if let Some(r) = PENDING_RESULT.lock().unwrap().take() {
                 let dir = if r.is_error { "error" } else { &r.direction };
-                popup::show(&r.original, &r.translated, dir);
+                popup::show_translation(&r.original, &r.translated, dir, r.engine);
             }
 
             // Apply settings changes from the settings window.
@@ -374,17 +377,19 @@ fn handle_text_translate() {
     thread::spawn(move || {
         init_com_in_thread();
         let result = match translate::translate(&text) {
-            Ok((translated, direction)) => {
+            Ok(t) => {
                 println!(
-                    "[+] Translated ({}): {}...",
-                    direction,
-                    utils::truncate(&translated, 80)
+                    "[+] Translated ({}, {:?}): {}...",
+                    t.direction,
+                    t.engine,
+                    utils::truncate(&t.text, 80)
                 );
                 TranslationResult {
                     original: text,
-                    translated,
-                    direction,
+                    translated: t.text,
+                    direction: t.direction,
                     is_error: false,
+                    engine: Some(t.engine),
                 }
             }
             Err(e) => {
@@ -394,6 +399,7 @@ fn handle_text_translate() {
                     translated: format!("{}{e}", i18n::t("popup.error_prefix")),
                     direction: String::new(),
                     is_error: true,
+                    engine: None,
                 }
             }
         };
@@ -462,6 +468,7 @@ fn do_ocr_and_translate(pixels: &[u8], width: u32, height: u32) {
                     translated: i18n::t("popup.no_text").to_string(),
                     direction: "info".into(),
                     is_error: false,
+                    engine: None,
                 });
                 return;
             }
@@ -472,6 +479,7 @@ fn do_ocr_and_translate(pixels: &[u8], width: u32, height: u32) {
                     translated: format!("{}{e}", i18n::t("popup.ocr_error_prefix")),
                     direction: String::new(),
                     is_error: true,
+                    engine: None,
                 });
                 return;
             }
@@ -488,13 +496,14 @@ fn do_ocr_and_translate(pixels: &[u8], width: u32, height: u32) {
         }
 
         let result = match translate::translate(&text) {
-            Ok((translated, direction)) => {
-                println!("[+] Translated: {}...", utils::truncate(&translated, 80));
+            Ok(t) => {
+                println!("[+] Translated ({:?}): {}...", t.engine, utils::truncate(&t.text, 80));
                 TranslationResult {
                     original: text,
-                    translated,
-                    direction,
+                    translated: t.text,
+                    direction: t.direction,
                     is_error: false,
+                    engine: Some(t.engine),
                 }
             }
             Err(e) => {
@@ -504,6 +513,7 @@ fn do_ocr_and_translate(pixels: &[u8], width: u32, height: u32) {
                     translated: format!("{}{e}", i18n::t("popup.error_prefix")),
                     direction: String::new(),
                     is_error: true,
+                    engine: None,
                 }
             }
         };
